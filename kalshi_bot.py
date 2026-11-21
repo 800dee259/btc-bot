@@ -212,17 +212,36 @@ def stamp():
     return datetime.now().strftime("%H:%M:%S")
 
 
+STATE_FILE = "kalshi_state.json"
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(day, traded, trades_today, start_bal):
+    with open(STATE_FILE, "w") as f:
+        json.dump({"day": str(day), "traded": sorted(traded),
+                   "trades_today": trades_today, "start_bal": start_bal}, f)
+
+
 def run(api, send_orders, once):
-    traded = set()
     day = datetime.now(timezone.utc).date()
-    trades_today = 0
-    start_bal = None
-    if api.key:
+    st = load_state()
+    if st.get("day") != str(day):
+        st = {"day": str(day), "traded": [], "trades_today": 0, "start_bal": None}
+    traded, trades_today, start_bal = set(st["traded"]), st["trades_today"], st["start_bal"]
+    if api.key and start_bal is None:
         try:
             start_bal = api.balance_usd()
             print(f"[{stamp()}] starting balance ${start_bal:,.2f}")
         except Exception as e:
             print(f"[{stamp()}] could not read balance: {e}")
+    save_state(day, traded, trades_today, start_bal)
     if send_orders and start_bal is None:
         print("Refusing to send orders without a readable balance (needed for the loss limit).")
         return
@@ -232,7 +251,9 @@ def run(api, send_orders, once):
             today = datetime.now(timezone.utc).date()
             if today != day:
                 day, trades_today = today, 0
+                traded.clear()
                 start_bal = api.balance_usd() if api.key else None
+                save_state(day, traded, trades_today, start_bal)
 
             if send_orders and start_bal is not None:
                 bal = api.balance_usd()
@@ -261,6 +282,7 @@ def run(api, send_orders, once):
                     else:
                         print(f"[{stamp()}] DRY RUN would place: {desc}")
                     traded.add(m["ticker"])
+                    save_state(day, traded, trades_today, start_bal)
         except Exception as e:
             print(f"[{stamp()}] error: {e}")
         if once:
