@@ -215,6 +215,23 @@ def stamp():
 STATE_FILE = "kalshi_state.json"
 
 
+def notify(title, message):
+    """Optional phone alert through ntfy.sh. Set NTFY_TOPIC to turn it on."""
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        return
+    try:
+        req = urllib.request.Request(
+            "https://ntfy.sh/" + urllib.parse.quote(topic),
+            data=message.encode("utf-8"),
+            headers={"Title": title, "Priority": "high", "User-Agent": "kalshi-bot/1.0"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10).close()
+    except Exception as e:
+        print(f"[{stamp()}] could not send alert: {e}")
+
+
 def load_state():
     try:
         with open(STATE_FILE) as f:
@@ -281,6 +298,13 @@ def run(api, send_orders, once):
                         trades_today += 1
                     else:
                         print(f"[{stamp()}] DRY RUN would place: {desc}")
+                        mins = (parse_time(m["close_time"]) - now).total_seconds() / 60
+                        kalshi_side = "YES (price goes UP)" if action["name"] == "UP" else "NO (price goes DOWN)"
+                        notify("Kalshi BTC signal",
+                               f"Buy {kalshi_side} on the 15-min Bitcoin market. "
+                               f"Price about {action['cost'] * 100:.0f}c, model edge {action['edge'] * 100:+.0f}c. "
+                               f"Closes in {mins:.0f} min. Check the live price in the Kalshi app first; "
+                               f"this alert may be a few minutes old.")
                     traded.add(m["ticker"])
                     save_state(day, traded, trades_today, start_bal)
         except Exception as e:
