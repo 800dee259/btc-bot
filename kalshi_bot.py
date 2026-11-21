@@ -37,14 +37,17 @@ from datetime import datetime, timezone
 
 PROD = "https://external-api.kalshi.com/trade-api/v2"
 DEMO = "https://external-api.demo.kalshi.co/trade-api/v2"
-SERIES = "KXBTC15M"
+# (label, Kalshi series, Coinbase product)
+ASSETS = [
+    ("BTC", "KXBTC15M", "BTC-USD"),
+]
 
 # ---- settings you can change ----
 STAKE_USD = 5.0            # max spend per trade
 MIN_EDGE = 0.08            # model chance must beat price + fee by 8 cents
 MAX_EDGE = 0.30            # bigger "edges" are treated as model/data errors and skipped
 FEE_RATE = 0.07            # approx. taker fee = FEE_RATE * p * (1 - p) per contract; verify on Kalshi
-BASIS_USD = 15.0           # allowance for Coinbase spot differing from Kalshi's reference price
+BASIS_FRAC = 0.00017       # allowance for Coinbase spot differing from Kalshi's reference (about $15 on BTC at 90k)
 MIN_SECS_LEFT = 120        # don't trade in the last 2 minutes
 MAX_SECS_LEFT = 600        # don't trade in the first 5 minutes
 MAX_TRADES_PER_DAY = 20
@@ -99,9 +102,9 @@ class Kalshi:
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"{method} {endpoint} -> HTTP {e.code}: {e.read().decode()[:300]}")
 
-    def open_market(self):
+    def open_market(self, series):
         res = self.call("GET", "/markets",
-                        {"series_ticker": SERIES, "status": "open", "limit": 20})
+                        {"series_ticker": series, "status": "open", "limit": 20})
         now = datetime.now(timezone.utc)
         live = [m for m in res.get("markets", []) if parse_time(m["close_time"]) > now]
         live.sort(key=lambda m: m["close_time"])
@@ -134,14 +137,14 @@ def http_json(url):
         return json.load(r)
 
 
-def spot_price():
-    return float(http_json("https://api.exchange.coinbase.com/products/BTC-USD/ticker")["price"])
+def spot_price(product):
+    return float(http_json(f"https://api.exchange.coinbase.com/products/{product}/ticker")["price"])
 
 
-def minute_sigma(spot):
+def minute_sigma(spot, product):
     """Std dev of 1-minute price changes in dollars (per sqrt-minute)."""
     try:
-        rows = http_json("https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60")
+        rows = http_json(f"https://api.exchange.coinbase.com/products/{product}/candles?granularity=60")
         closes = [r[4] for r in rows[:45]][::-1]
         d = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
         m = sum(d) / len(d)
@@ -156,7 +159,7 @@ def phi(z):
 
 
 def prob_up(spot, strike, secs_left, sigma):
-    sd = math.sqrt(sigma ** 2 * (secs_left / 60.0) + BASIS_USD ** 2)
+    sd = math.sqrt(sigma ** 2 * (secs_left / 60.0) + (BASIS_FRAC * spot) ** 2)
     return min(0.95, max(0.05, phi((spot - strike) / sd)))
 
 
@@ -278,35 +281,39 @@ def run(api, send_orders, once):
                     print(f"[{stamp()}] daily loss limit reached (${bal:,.2f}). Stopping.")
                     return
 
-            m = api.open_market()
-            if not m:
-                print(f"[{stamp()}] no open {SERIES} market found")
-            else:
-                spot = spot_price()
-                now = datetime.now(timezone.utc)
-                action, info = decide(m, spot, minute_sigma(spot), now)
-                print(f"[{stamp()}] {m['ticker']} spot={spot:,.2f} strike={m.get('floor_strike')} | {info}")
-                if action and m["ticker"] not in traded and trades_today < MAX_TRADES_PER_DAY:
-                    desc = (f"{action['name']} x{action['count']} @ ~{action['cost']:.2f} "
-                            f"(edge {action['edge']:+.2f}) on {m['ticker']}")
-                    if send_orders:
-                        res = api.place(m["ticker"], action["side"], action["price"], action["count"])
-                        print(f"[{stamp()}] ORDER {desc} -> filled {res.get('fill_count')} "
-                              f"of {action['count']}, remaining {res.get('remaining_count')}")
-                        log_trade({"t": now.isoformat(), "market": m["ticker"], "action": action,
-                                   "spot": spot, "response": res})
-                        trades_today += 1
-                    else:
-                        print(f"[{stamp()}] DRY RUN would place: {desc}")
-                        mins = (parse_time(m["close_time"]) - now).total_seconds() / 60
-                        kalshi_side = "YES (price goes UP)" if action["name"] == "UP" else "NO (price goes DOWN)"
-                        notify("Kalshi BTC signal",
-                               f"Buy {kalshi_side} on the 15-min Bitcoin market. "
-                               f"Price about {action['cost'] * 100:.0f}c, model edge {action['edge'] * 100:+.0f}c. "
-                               f"Closes in {mins:.0f} min. Check the live price in the Kalshi app first; "
-                               f"this alert may be a few minutes old.")
-                    traded.add(m["ticker"])
-                    save_state(day, traded, trades_today, start_bal)
+            for label, series, product in ASSETS:
+                try:
+                    m = api.open_market(series)
+                    if not m:
+                        print(f"[{stamp()}] {label}: no open {series} market found")
+                        continue
+                    spot = spot_price(product)
+                    now = datetime.now(timezone.utc)
+                    action, info = decide(m, spot, minute_sigma(spot, product), now)
+                    print(f"[{stamp()}] {label} {m['ticker']} spot={spot:,.2f} strike={m.get('floor_strike')} | {info}")
+                    if action and m["ticker"] not in traded and trades_today < MAX_TRADES_PER_DAY:
+                        desc = (f"{label} {action['name']} x{action['count']} @ ~{action['cost']:.2f} "
+                                f"(edge {action['edge']:+.2f}) on {m['ticker']}")
+                        if send_orders:
+                            res = api.place(m["ticker"], action["side"], action["price"], action["count"])
+                            print(f"[{stamp()}] ORDER {desc} -> filled {res.get('fill_count')} "
+                                  f"of {action['count']}, remaining {res.get('remaining_count')}")
+                            log_trade({"t": now.isoformat(), "market": m["ticker"], "action": action,
+                                       "spot": spot, "response": res})
+                            trades_today += 1
+                        else:
+                            print(f"[{stamp()}] DRY RUN would place: {desc}")
+                            mins = (parse_time(m["close_time"]) - now).total_seconds() / 60
+                            kalshi_side = "YES (price goes UP)" if action["name"] == "UP" else "NO (price goes DOWN)"
+                            notify(f"Kalshi {label} signal",
+                                   f"Buy {kalshi_side} on the 15-min {label} market. "
+                                   f"Price about {action['cost'] * 100:.0f}c, model edge {action['edge'] * 100:+.0f}c. "
+                                   f"Closes in {mins:.0f} min. Check the live price in the Kalshi app first; "
+                                   f"this alert may be a few minutes old.")
+                        traded.add(m["ticker"])
+                        save_state(day, traded, trades_today, start_bal)
+                except Exception as e:
+                    print(f"[{stamp()}] {label} error: {e}")
         except Exception as e:
             print(f"[{stamp()}] error: {e}")
         if once:
@@ -330,7 +337,8 @@ def main():
 
     api = Kalshi(PROD if not a.demo else DEMO, key_id, key_path)
     mode = "LIVE" if a.live else "DEMO" if a.demo else "DRY RUN (no orders)"
-    print(f"Kalshi {SERIES} bot | mode: {mode} | stake ${STAKE_USD:.2f} | min edge {MIN_EDGE:.2f}")
+    names = ", ".join(s for _, s, _ in ASSETS)
+    print(f"Kalshi bot ({names}) | mode: {mode} | stake ${STAKE_USD:.2f} | min edge {MIN_EDGE:.2f}")
     run(api, send_orders=a.demo or a.live, once=a.once)
 
 
