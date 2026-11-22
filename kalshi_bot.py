@@ -383,6 +383,9 @@ def main():
     mode = "LIVE" if a.live else "DEMO" if a.demo else "DRY RUN (no orders)"
     names = ", ".join(s for _, s, _ in ASSETS)
     print(f"Kalshi bot ({names}) | mode: {mode} | stake ${STAKE_USD:.2f} | min edge {MIN_EDGE:.2f}")
+    # On GitHub, tapping "Run workflow" sets this; scheduled runs do not.
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        notify("Kalshi bot test", f"Manual run worked. Telegram alerts are connected. Mode: {mode}")
     if not a.once:
         notify("Kalshi bot started", f"Mode: {mode} | stake ${STAKE_USD:.2f} | min edge {MIN_EDGE:.2f}")
     try:
