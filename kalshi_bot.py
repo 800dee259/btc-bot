@@ -44,7 +44,7 @@ ASSETS = [
 
 # ---- settings you can change ----
 STAKE_USD = 5.0            # max spend per trade
-MIN_EDGE = 0.05            # model chance must beat price + fee by 8 cents
+MIN_EDGE = 0.00            # model chance must beat price + fee by 8 cents
 MAX_EDGE = 0.30            # bigger "edges" are treated as model/data errors and skipped
 FEE_RATE = 0.07            # approx. taker fee = FEE_RATE * p * (1 - p) per contract; verify on Kalshi
 BASIS_FRAC = 0.00017       # allowance for Coinbase spot differing from Kalshi's reference (about $15 on BTC at 90k)
