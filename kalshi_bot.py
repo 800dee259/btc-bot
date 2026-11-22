@@ -20,6 +20,12 @@ Setup
   export KALSHI_KEY_PATH="/path/to/your/private-key.pem"
   (Demo and live use different accounts and different keys.)
 
+Telegram alerts (optional)
+  export TELEGRAM_TOKEN="your-bot-token"
+  export TELEGRAM_CHAT_ID="your-chat-id"
+  Alerts: startup, signals (dry run), orders/fills, errors, loss limit, crash, heartbeat.
+  (If these are not set but NTFY_TOPIC is, alerts go through ntfy.sh instead.)
+
 NOT financial advice. The model is simple and has no proven edge. Test in dry-run,
 then demo, and use only money you can afford to lose.
 """
@@ -54,6 +60,8 @@ MAX_TRADES_PER_DAY = 20
 MAX_DAILY_LOSS_USD = 20.0  # stop trading if cash balance falls this far below the start
 POLL_SECS = 10
 TRADE_LOG = "kalshi_trades.jsonl"
+HEARTBEAT_SECS = 1800      # "still alive" ping every 30 minutes
+ERROR_ALERT_COOLDOWN = 900  # send the same kind of error alert at most every 15 minutes
 
 
 # ---------- Kalshi API ----------
@@ -216,21 +224,37 @@ def stamp():
 
 
 STATE_FILE = "kalshi_state.json"
+_last_alert = {}
 
 
-def notify(title, message):
-    """Optional phone alert through ntfy.sh. Set NTFY_TOPIC to turn it on."""
+def notify(title, message, key=None, cooldown=0):
+    """Phone alert. Uses Telegram if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID are set,
+    otherwise ntfy.sh if NTFY_TOPIC is set. Never raises.
+    key + cooldown (seconds) rate-limits repeated alerts of the same kind."""
+    if key:
+        if time.time() - _last_alert.get(key, 0) < cooldown:
+            return
+        _last_alert[key] = time.time()
+    token, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     topic = os.environ.get("NTFY_TOPIC")
-    if not topic:
-        return
     try:
-        req = urllib.request.Request(
-            "https://ntfy.sh/" + urllib.parse.quote(topic),
-            data=message.encode("utf-8"),
-            headers={"Title": title, "Priority": "high", "User-Agent": "kalshi-bot/1.0"},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=10).close()
+        if token and chat:
+            body = json.dumps({"chat_id": chat, "text": f"{title}\n{message}"}).encode("utf-8")
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=body,
+                headers={"Content-Type": "application/json", "User-Agent": "kalshi-bot/1.0"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10).close()
+        elif topic:
+            req = urllib.request.Request(
+                "https://ntfy.sh/" + urllib.parse.quote(topic),
+                data=message.encode("utf-8"),
+                headers={"Title": title, "Priority": "high", "User-Agent": "kalshi-bot/1.0"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10).close()
     except Exception as e:
         print(f"[{stamp()}] could not send alert: {e}")
 
@@ -264,7 +288,10 @@ def run(api, send_orders, once):
     save_state(day, traded, trades_today, start_bal)
     if send_orders and start_bal is None:
         print("Refusing to send orders without a readable balance (needed for the loss limit).")
+        notify("Kalshi bot NOT started", "Could not read balance, so orders are disabled. Check API key.")
         return
+
+    last_heartbeat = time.time()
 
     while True:
         try:
@@ -275,11 +302,21 @@ def run(api, send_orders, once):
                 start_bal = api.balance_usd() if api.key else None
                 save_state(day, traded, trades_today, start_bal)
 
+            bal = None
             if send_orders and start_bal is not None:
                 bal = api.balance_usd()
                 if bal <= start_bal - MAX_DAILY_LOSS_USD:
                     print(f"[{stamp()}] daily loss limit reached (${bal:,.2f}). Stopping.")
+                    notify("Kalshi bot STOPPED: daily loss limit",
+                           f"Balance ${bal:,.2f} (started ${start_bal:,.2f}). No more trades today.")
                     return
+
+            if not once and time.time() - last_heartbeat >= HEARTBEAT_SECS:
+                last_heartbeat = time.time()
+                msg = f"{trades_today} trades today"
+                if bal is not None:
+                    msg += f", balance ${bal:,.2f}"
+                notify("Kalshi bot alive", msg)
 
             for label, series, product in ASSETS:
                 try:
@@ -301,6 +338,10 @@ def run(api, send_orders, once):
                             log_trade({"t": now.isoformat(), "market": m["ticker"], "action": action,
                                        "spot": spot, "response": res})
                             trades_today += 1
+                            notify(f"Kalshi {label} order",
+                                   f"{desc}\nFilled {res.get('fill_count')} of {action['count']}, "
+                                   f"remaining {res.get('remaining_count')}. "
+                                   f"Trades today: {trades_today}")
                         else:
                             print(f"[{stamp()}] DRY RUN would place: {desc}")
                             mins = (parse_time(m["close_time"]) - now).total_seconds() / 60
@@ -314,8 +355,11 @@ def run(api, send_orders, once):
                         save_state(day, traded, trades_today, start_bal)
                 except Exception as e:
                     print(f"[{stamp()}] {label} error: {e}")
+                    notify(f"Kalshi {label} error", str(e)[:300],
+                           key=f"err-{label}", cooldown=ERROR_ALERT_COOLDOWN)
         except Exception as e:
             print(f"[{stamp()}] error: {e}")
+            notify("Kalshi bot error", str(e)[:300], key="err-loop", cooldown=ERROR_ALERT_COOLDOWN)
         if once:
             return
         time.sleep(POLL_SECS)
@@ -339,7 +383,15 @@ def main():
     mode = "LIVE" if a.live else "DEMO" if a.demo else "DRY RUN (no orders)"
     names = ", ".join(s for _, s, _ in ASSETS)
     print(f"Kalshi bot ({names}) | mode: {mode} | stake ${STAKE_USD:.2f} | min edge {MIN_EDGE:.2f}")
-    run(api, send_orders=a.demo or a.live, once=a.once)
+    if not a.once:
+        notify("Kalshi bot started", f"Mode: {mode} | stake ${STAKE_USD:.2f} | min edge {MIN_EDGE:.2f}")
+    try:
+        run(api, send_orders=a.demo or a.live, once=a.once)
+    except KeyboardInterrupt:
+        notify("Kalshi bot stopped", "Stopped manually (Ctrl+C).")
+    except Exception as e:
+        notify("Kalshi bot CRASHED", f"{type(e).__name__}: {str(e)[:300]}")
+        raise
 
 
 if __name__ == "__main__":
