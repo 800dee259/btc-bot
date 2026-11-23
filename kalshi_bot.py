@@ -59,6 +59,11 @@ ASSETS = [
 STAKE_USD = 5.0            # max spend per trade
 MIN_EDGE = 0.08            # model chance must beat price + fee by 8 cents
 MAX_EDGE = 0.30            # bigger "edges" are treated as model/data errors and skipped
+MIN_PRICE = 0.05           # skip a side whose ask is below this (fees/model error dominate)
+MAX_PRICE = 0.95           # skip a side whose ask is above this
+PROB_FLOOR = 0.05          # model probability is clamped to [PROB_FLOOR, PROB_CAP]
+PROB_CAP = 0.95            # keep MIN_PRICE/MAX_PRICE inside this range so a clamped model
+                           # probability can never look like an edge against an extreme price
 FEE_RATE = 0.07            # approx. taker fee = FEE_RATE * p * (1 - p) per contract; verify on Kalshi
 BASIS_FRAC = 0.00017       # allowance for Coinbase spot differing from Kalshi's reference (about $15 on BTC at 90k)
 MIN_SECS_LEFT = 120        # don't trade in the last 2 minutes
@@ -185,7 +190,7 @@ def phi(z):
 
 def prob_up(spot, strike, secs_left, sigma):
     sd = math.sqrt(sigma ** 2 * (secs_left / 60.0) + (BASIS_FRAC * spot) ** 2)
-    return min(0.95, max(0.05, phi((spot - strike) / sd)))
+    return min(PROB_CAP, max(PROB_FLOOR, phi((spot - strike) / sd)))
 
 
 def fee(p):
@@ -210,12 +215,16 @@ def decide(m, spot, sigma, now):
     p = prob_up(spot, float(strike), secs, sigma)
     ya, yb, na = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars"), num(m, "no_ask_dollars")
     options = []
-    if 0 < ya < 1:
+    # Only consider a side if its price is inside [MIN_PRICE, MAX_PRICE]. At extreme prices
+    # fees and model error dominate, and the clamped model probability can fake an edge.
+    if MIN_PRICE <= ya <= MAX_PRICE:
         options.append(("UP", "bid", ya, ya, p - ya - fee(ya)))
-    if 0 < na < 1 and 0 < yb < 1:
+    if MIN_PRICE <= na <= MAX_PRICE and 0 < yb < 1:
         options.append(("DOWN", "ask", yb, na, (1 - p) - na - fee(na)))
     info = f"model up={p:.0%} yes_ask={ya:.2f} no_ask={na:.2f}"
     if not options:
+        if 0 < ya < 1 or 0 < na < 1:
+            return None, info + " | price too extreme, skipping"
         return None, info + " | no liquidity"
     name, side, order_price, cost, edge = max(options, key=lambda o: o[4])
     info += f" | best={name} edge={edge:+.2f}"
