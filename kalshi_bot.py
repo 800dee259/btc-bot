@@ -23,7 +23,12 @@ Setup
 Telegram alerts (optional)
   export TELEGRAM_TOKEN="your-bot-token"
   export TELEGRAM_CHAT_ID="your-chat-id"
+  TELEGRAM_CHAT_ID can hold several chats separated by commas (e.g. a group and a person).
   Alerts: startup, signals (dry run), orders/fills, errors, loss limit, crash, heartbeat.
+
+Always-on hosting (Railway/Render/VPS)
+  Start command: python kalshi_bot.py   (no --once). Set POLL_SECS=1 for 1-second checks.
+  Instead of KALSHI_KEY_PATH you may set KALSHI_PRIVATE_KEY to the key's text.
   (If these are not set but NTFY_TOPIC is, alerts go through ntfy.sh instead.)
 
 NOT financial advice. The model is simple and has no proven edge. Test in dry-run,
@@ -38,7 +43,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 PROD = "https://external-api.kalshi.com/trade-api/v2"
@@ -58,7 +65,9 @@ MIN_SECS_LEFT = 120        # don't trade in the last 2 minutes
 MAX_SECS_LEFT = 600        # don't trade in the first 5 minutes
 MAX_TRADES_PER_DAY = 20
 MAX_DAILY_LOSS_USD = 20.0  # stop trading if cash balance falls this far below the start
-POLL_SECS = 10
+POLL_SECS = float(os.environ.get("POLL_SECS", "2"))  # seconds between checks; set POLL_SECS=1 for faster
+SIGMA_REFRESH_SECS = 60    # recompute volatility this often (saves API calls)
+LOG_EVERY_SECS = 15        # print a status line at most this often
 TRADE_LOG = "kalshi_trades.jsonl"
 HEARTBEAT_SECS = 1800      # "still alive" ping every 30 minutes
 ERROR_ALERT_COOLDOWN = 900  # send the same kind of error alert at most every 15 minutes
@@ -149,16 +158,24 @@ def spot_price(product):
     return float(http_json(f"https://api.exchange.coinbase.com/products/{product}/ticker")["price"])
 
 
+_sigma_cache = {}
+
+
 def minute_sigma(spot, product):
-    """Std dev of 1-minute price changes in dollars (per sqrt-minute)."""
-    try:
-        rows = http_json(f"https://api.exchange.coinbase.com/products/{product}/candles?granularity=60")
-        closes = [r[4] for r in rows[:45]][::-1]
-        d = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-        m = sum(d) / len(d)
-        s = math.sqrt(sum((x - m) ** 2 for x in d) / len(d))
-    except Exception:
-        s = 0.0008 * spot
+    """Std dev of 1-minute price changes in dollars (per sqrt-minute). Cached to save API calls."""
+    hit = _sigma_cache.get(product)
+    if hit and time.time() - hit[0] < SIGMA_REFRESH_SECS:
+        s = hit[1]
+    else:
+        try:
+            rows = http_json(f"https://api.exchange.coinbase.com/products/{product}/candles?granularity=60")
+            closes = [r[4] for r in rows[:45]][::-1]
+            d = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+            m = sum(d) / len(d)
+            s = math.sqrt(sum((x - m) ** 2 for x in d) / len(d))
+        except Exception:
+            s = 0.0008 * spot
+        _sigma_cache[product] = (time.time(), s)
     return min(max(s, 0.0003 * spot), 0.003 * spot)
 
 
@@ -227,9 +244,14 @@ STATE_FILE = "kalshi_state.json"
 _last_alert = {}
 
 
-def notify(title, message, key=None, cooldown=0):
-    """Phone alert. Uses Telegram if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID are set,
-    otherwise ntfy.sh if NTFY_TOPIC is set. Never raises.
+_pending = []
+
+
+def notify(title, message, key=None, cooldown=0, block=False):
+    """Phone alert. Uses Telegram if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID are set
+    (several chat IDs may be separated by commas), otherwise ntfy.sh if NTFY_TOPIC is set.
+    Sends in the background so a slow network never delays the trading loop; call
+    flush_alerts() before exiting. Never raises.
     key + cooldown (seconds) rate-limits repeated alerts of the same kind."""
     if key:
         if time.time() - _last_alert.get(key, 0) < cooldown:
@@ -237,26 +259,43 @@ def notify(title, message, key=None, cooldown=0):
         _last_alert[key] = time.time()
     token, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     topic = os.environ.get("NTFY_TOPIC")
-    try:
+
+    def post(req):
+        try:
+            urllib.request.urlopen(req, timeout=10).close()
+        except Exception as e:
+            print(f"[{stamp()}] could not send alert: {e}")
+
+    def send():
         if token and chat:
-            body = json.dumps({"chat_id": chat, "text": f"{title}\n{message}"}).encode("utf-8")
-            req = urllib.request.Request(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                data=body,
-                headers={"Content-Type": "application/json", "User-Agent": "kalshi-bot/1.0"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=10).close()
+            for cid in [c.strip() for c in chat.split(",") if c.strip()]:
+                body = json.dumps({"chat_id": cid, "text": f"{title}\n{message}"}).encode("utf-8")
+                post(urllib.request.Request(
+                    f"https://api.telegram.org/bot{token}/sendMessage", data=body,
+                    headers={"Content-Type": "application/json", "User-Agent": "kalshi-bot/1.0"},
+                    method="POST"))
         elif topic:
-            req = urllib.request.Request(
-                "https://ntfy.sh/" + urllib.parse.quote(topic),
-                data=message.encode("utf-8"),
+            post(urllib.request.Request(
+                "https://ntfy.sh/" + urllib.parse.quote(topic), data=message.encode("utf-8"),
                 headers={"Title": title, "Priority": "high", "User-Agent": "kalshi-bot/1.0"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=10).close()
-    except Exception as e:
-        print(f"[{stamp()}] could not send alert: {e}")
+                method="POST"))
+
+    if not (token and chat) and not topic:
+        return
+    if block:
+        send()
+    else:
+        t = threading.Thread(target=send, daemon=True)
+        t.start()
+        _pending.append(t)
+
+
+def flush_alerts(timeout=15):
+    """Wait for background alerts to finish (call before the program exits)."""
+    deadline = time.time() + timeout
+    for t in _pending:
+        t.join(max(0.0, deadline - time.time()))
+    _pending.clear()
 
 
 def load_state():
@@ -292,8 +331,11 @@ def run(api, send_orders, once):
         return
 
     last_heartbeat = time.time()
+    last_log = {}
+    pool = ThreadPoolExecutor(max_workers=4)
 
     while True:
+        loop_start = time.time()
         try:
             today = datetime.now(timezone.utc).date()
             if today != day:
@@ -320,14 +362,17 @@ def run(api, send_orders, once):
 
             for label, series, product in ASSETS:
                 try:
-                    m = api.open_market(series)
+                    f_market = pool.submit(api.open_market, series)
+                    f_spot = pool.submit(spot_price, product)
+                    m, spot = f_market.result(), f_spot.result()
                     if not m:
                         print(f"[{stamp()}] {label}: no open {series} market found")
                         continue
-                    spot = spot_price(product)
                     now = datetime.now(timezone.utc)
                     action, info = decide(m, spot, minute_sigma(spot, product), now)
-                    print(f"[{stamp()}] {label} {m['ticker']} spot={spot:,.2f} strike={m.get('floor_strike')} | {info}")
+                    if (action and m["ticker"] not in traded) or time.time() - last_log.get(label, 0) >= LOG_EVERY_SECS:
+                        last_log[label] = time.time()
+                        print(f"[{stamp()}] {label} {m['ticker']} spot={spot:,.2f} strike={m.get('floor_strike')} | {info}")
                     if action and m["ticker"] not in traded and trades_today < MAX_TRADES_PER_DAY:
                         desc = (f"{label} {action['name']} x{action['count']} @ ~{action['cost']:.2f} "
                                 f"(edge {action['edge']:+.2f}) on {m['ticker']}")
@@ -362,7 +407,7 @@ def run(api, send_orders, once):
             notify("Kalshi bot error", str(e)[:300], key="err-loop", cooldown=ERROR_ALERT_COOLDOWN)
         if once:
             return
-        time.sleep(POLL_SECS)
+        time.sleep(max(0.0, POLL_SECS - (time.time() - loop_start)))
 
 
 def main():
@@ -374,6 +419,12 @@ def main():
     a = ap.parse_args()
 
     key_id, key_path = os.environ.get("KALSHI_KEY_ID"), os.environ.get("KALSHI_KEY_PATH")
+    key_text = os.environ.get("KALSHI_PRIVATE_KEY")
+    if key_id and key_text and not key_path:
+        key_path = "kalshi_key.pem"
+        with open(key_path, "w") as f:
+            f.write(key_text.replace("\\n", "\n").strip() + "\n")
+        os.chmod(key_path, 0o600)
     if (a.demo or a.live) and not (key_id and key_path):
         raise SystemExit("Set KALSHI_KEY_ID and KALSHI_KEY_PATH first.")
     if a.live and input("LIVE mode places REAL orders. Type YES to continue: ") != "YES":
@@ -382,7 +433,7 @@ def main():
     api = Kalshi(PROD if not a.demo else DEMO, key_id, key_path)
     mode = "LIVE" if a.live else "DEMO" if a.demo else "DRY RUN (no orders)"
     names = ", ".join(s for _, s, _ in ASSETS)
-    print(f"Kalshi bot ({names}) | mode: {mode} | stake ${STAKE_USD:.2f} | min edge {MIN_EDGE:.2f}")
+    print(f"Kalshi bot ({names}) | mode: {mode} | stake ${STAKE_USD:.2f} | min edge {MIN_EDGE:.2f} | poll {POLL_SECS:g}s")
     # On GitHub, tapping "Run workflow" sets this; scheduled runs do not.
     if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
         notify("Kalshi bot test", f"Manual run worked. Telegram alerts are connected. Mode: {mode}")
@@ -391,10 +442,12 @@ def main():
     try:
         run(api, send_orders=a.demo or a.live, once=a.once)
     except KeyboardInterrupt:
-        notify("Kalshi bot stopped", "Stopped manually (Ctrl+C).")
+        notify("Kalshi bot stopped", "Stopped manually (Ctrl+C).", block=True)
     except Exception as e:
-        notify("Kalshi bot CRASHED", f"{type(e).__name__}: {str(e)[:300]}")
+        notify("Kalshi bot CRASHED", f"{type(e).__name__}: {str(e)[:300]}", block=True)
         raise
+    finally:
+        flush_alerts()
 
 
 if __name__ == "__main__":
