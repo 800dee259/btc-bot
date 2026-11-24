@@ -94,7 +94,7 @@ SPOT_SOURCES = {
 
 # ---- settings you can change ----
 STAKE_USD = 5.0            # max spend per trade
-MIN_EDGE = 0.08            # model chance must beat price + fee by 8 cents
+MIN_EDGE = 0.06            # model chance must beat price + fee by 8 cents
 MAX_EDGE = 0.30            # bigger "edges" are treated as model/data errors and skipped
 MIN_PRICE = 0.05           # skip a side whose ask is below this (fees/model error dominate)
 MAX_PRICE = 0.95           # skip a side whose ask is above this
