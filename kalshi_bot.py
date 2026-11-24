@@ -30,6 +30,24 @@ What changed from v1
     - After each window closes, logs model vs market accuracy (Brier score) to
       kalshi_calibration.jsonl so you can see whether the model has any edge.
 
+Speed (v2.1)
+  Nothing in the decision path waits on the network. Background threads keep Kalshi's quote and
+  every exchange price fresh in memory (each exchange at its own polite rate), and the decision
+  loop (20x per second) only reads those caches. Around each window boundary the bot polls Kalshi
+  10x per second to catch a new market within about a tenth of a second, and it loads the candles
+  for the open call a few seconds early so the call goes out the moment the market appears.
+  Safety: if the Kalshi quote or the exchange prices go stale, the bot skips instead of trading
+  on old data. Real-world speed is still limited by your internet distance to Kalshi, so run it
+  on a server close to them (a US East VPS is a good bet) rather than a home connection.
+
+Open call (new)
+  As soon as a new 15-minute market opens, the bot sends a call: which side it leans toward
+  (UP/YES or DOWN/NO), how strong the lean is, the strike, and the current Kalshi prices.
+  It is an ALERT ONLY and never places an order. At the open the price equals the strike, so
+  the lean comes from recent momentum and is deliberately small (a few points off 50%).
+  Each call is graded when the window settles and a running hit rate is printed and logged
+  in kalshi_calibration.jsonl. The trading signals later in the window are unchanged.
+
 Modes (safe by default)
   python kalshi_bot_v2.py            DRY RUN: reads markets, logs decisions, places NO orders
   python kalshi_bot_v2.py --demo     sends orders to Kalshi's DEMO environment (fake money)
@@ -63,13 +81,14 @@ import http.client
 import json
 import math
 import os
+import socket
 import statistics
 import threading
 import time
 import urllib.parse
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 PROD = "https://external-api.kalshi.com/trade-api/v2"
@@ -94,7 +113,7 @@ SPOT_SOURCES = {
 
 # ---- settings you can change ----
 STAKE_USD = 5.0            # max spend per trade
-MIN_EDGE = 0.06            # model chance must beat price + fee by 8 cents
+MIN_EDGE = 0.08            # model chance must beat price + fee by 8 cents
 MAX_EDGE = 0.30            # bigger "edges" are treated as model/data errors and skipped
 MIN_PRICE = 0.05           # skip a side whose ask is below this (fees/model error dominate)
 MAX_PRICE = 0.95           # skip a side whose ask is above this
@@ -114,21 +133,44 @@ MAX_TRADES_PER_DAY = 20
 MAX_DAILY_LOSS_USD = 20.0  # stop trading if cash balance falls this far below the start
 MAX_ATTEMPTS = 3           # tries per market if orders fill nothing
 RETRY_SECS = 5             # wait between those tries
-POLL_SECS = float(os.environ.get("POLL_SECS", "1"))  # seconds between checks; set POLL_SECS=1 for faster
+POLL_SECS = float(os.environ.get("POLL_SECS", "0.05"))  # decision loop speed; it only reads caches, so this is cheap
+QUOTE_GAP = 0.25           # seconds between Kalshi quote refreshes (background thread)
+BOUNDARY_GAP = 0.1         # faster refresh while a window is about to roll over or just did
+BOUNDARY_SECS = 3          # "about to roll over" = this many seconds before the close
+QUOTE_MAX_AGE = 2.0        # skip trading if the Kalshi quote is older than this
+FEED_MAX_AGE = 3.0         # ignore an exchange price older than this
+FEED_GAP = {"coinbase": 0.2, "kraken": 1.0, "bitstamp": 0.5, "gemini": 1.0}  # polite per-exchange gaps
+PREFETCH_SECS = 4          # load candles this long before a window ends so the open call is instant
+REQUEST_TIMEOUT = 4        # seconds before a stuck HTTP call is dropped
 SIGMA_REFRESH_SECS = 60    # recompute volatility this often (saves API calls)
 EWMA_LAMBDA = 0.94         # volatility decay per minute
 VOL_EWMA_WEIGHT = 0.6      # share of EWMA vs plain 1-hour realized vol
-BALANCE_REFRESH_SECS = 30
+BALANCE_REFRESH_SECS = 15      # also keeps the order connection warm
 LOG_EVERY_SECS = 15        # print a status line at most this often
 TRADE_LOG = "kalshi_trades.jsonl"
 CALIB_LOG = "kalshi_calibration.jsonl"
 STATE_FILE = "kalshi_state.json"
 HEARTBEAT_SECS = 1800      # "still alive" ping every 30 minutes
 ERROR_ALERT_COOLDOWN = 900  # send the same kind of error alert at most every 15 minutes
+OPEN_CALL = True           # send a direction call when a new market opens (alert only, no orders)
+WINDOW_SECS = 900          # length of one market
+OPEN_CALL_MAX_AGE = 90     # only call if the market opened less than this many seconds ago
+OPEN_TILT_MAX = 0.06       # biggest lean momentum may add to 50% (kept small on purpose)
 CLOSED_STATES = {"closed", "settled", "finalized", "determined", "inactive"}
 
 
 # ---------- fast HTTP (kept-alive connections, one per thread per host) ----------
+class _Conn(http.client.HTTPSConnection):
+    """HTTPS connection with Nagle's algorithm off, so small requests leave immediately."""
+
+    def connect(self):
+        super().connect()
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+
 _tls = threading.local()
 
 
@@ -138,7 +180,7 @@ def _conn(host):
         conns = _tls.conns = {}
     c = conns.get(host)
     if c is None:
-        c = conns[host] = http.client.HTTPSConnection(host, timeout=6)
+        c = conns[host] = _Conn(host, timeout=REQUEST_TIMEOUT)
     return c
 
 
@@ -242,38 +284,87 @@ class Kalshi:
 
 
 # ---------- spot price ----------
-_inflight = set()
-
-
 def parse_time(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def _fetch_one(name):
-    host, path, parse = SPOT_SOURCES[name]
-    try:
-        return parse(request(host, "GET", path))
-    finally:
-        _inflight.discard(name)
+class Feeds:
+    """Reads every exchange on its own thread and kept-alive connection, each at its own polite
+    rate. The decision loop just reads the latest values, so it never waits on an exchange."""
+
+    def __init__(self):
+        self.latest = {}                        # name -> (price, time.time())
+        self.stop = threading.Event()
+
+    def start(self):
+        for name in SPOT_SOURCES:
+            threading.Thread(target=self._loop, args=(name,), daemon=True).start()
+
+    def _loop(self, name):
+        host, path, parse = SPOT_SOURCES[name]
+        gap = FEED_GAP.get(name, 1.0)
+        while not self.stop.is_set():
+            t0 = time.time()
+            try:
+                self.latest[name] = (parse(request(host, "GET", path)), time.time())
+            except Exception:
+                self.stop.wait(2.0)             # back off after an error or a rate limit
+            self.stop.wait(max(0.0, gap - (time.time() - t0)))
+
+    def quotes(self, max_age=None):
+        max_age = FEED_MAX_AGE if max_age is None else max_age
+        now = time.time()
+        return {n: p for n, (p, t) in list(self.latest.items()) if now - t <= max_age}
 
 
-def spot_quotes(spot_pool, wait_secs=3.0):
-    """Ask every exchange in parallel; return whichever answered within wait_secs.
-    A feed that is still stuck from the last round is skipped, not queued."""
-    futs = {}
-    for name in SPOT_SOURCES:
-        if name in _inflight:
-            continue
-        _inflight.add(name)
-        futs[spot_pool.submit(_fetch_one, name)] = name
-    done, _ = wait(futs, timeout=wait_secs)
-    out = {}
-    for f in done:
-        try:
-            out[futs[f]] = f.result()
-        except Exception:
-            pass
-    return out
+class MarketWatcher:
+    """Keeps the newest Kalshi quote in memory. Polls steadily during a window and at 10x per
+    second around the boundary, so a new market is noticed almost the moment it is listed."""
+
+    def __init__(self, api):
+        self.api = api
+        self.snap = (None, 0.0)                 # (market dict or None, time fetched)
+        self.stop = threading.Event()
+        self.no_mkt_since = None
+        self._err_t = 0.0
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def step(self):
+        """One poll. Returns the seconds to wait before the next one."""
+        gap = QUOTE_GAP
+        cur = self.snap[0]
+        now = datetime.now(timezone.utc)
+        if cur is None or parse_time(cur["close_time"]) <= now:
+            m = self.api.open_market(SERIES)    # hunting for the next window
+            gap = BOUNDARY_GAP
+        else:
+            m = self.api.get_market(cur["ticker"])
+            if (parse_time(m["close_time"]) - now).total_seconds() <= BOUNDARY_SECS:
+                gap = BOUNDARY_GAP
+        if m is not None and m.get("status") in CLOSED_STATES:
+            m = None
+        if m is None:
+            self.no_mkt_since = self.no_mkt_since or time.time()
+            if time.time() - self.no_mkt_since > 20:
+                gap = 1.0                       # no market for a while: do not hammer the API
+        else:
+            self.no_mkt_since = None
+        self.snap = (m, time.time())
+        return gap
+
+    def _loop(self):
+        while not self.stop.is_set():
+            t0 = time.time()
+            try:
+                gap = self.step()
+            except Exception as e:
+                gap = 0.5
+                if time.time() - self._err_t > 10:
+                    self._err_t = time.time()
+                    print(f"[{stamp()}] Kalshi quote error: {e}")
+            self.stop.wait(max(0.0, gap - (time.time() - t0)))
 
 
 def combine(quotes):
@@ -290,6 +381,11 @@ def combine(quotes):
 
 
 # ---------- volatility ----------
+def fetch_candles():
+    """1-minute Coinbase candles, newest first: [time, low, high, open, close, volume]."""
+    return request("api.exchange.coinbase.com", "GET", f"/products/{PRODUCT}/candles?granularity=60")
+
+
 class Vol:
     """Std dev of 1-minute price changes in dollars (per sqrt-minute), refreshed in the background."""
 
@@ -298,8 +394,7 @@ class Vol:
 
     def _refresh(self):
         try:
-            rows = request("api.exchange.coinbase.com", "GET",
-                           f"/products/{PRODUCT}/candles?granularity=60")
+            rows = fetch_candles()
             closes = [r[4] for r in rows[:61]][::-1]            # oldest -> newest
             d = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
             if len(d) >= 10:
@@ -404,22 +499,56 @@ def decide(m, spot, sigma, now):
             "cost": cost, "edge": edge}, info, snap
 
 
+def _clip(x, lim=3.0):
+    return max(-lim, min(lim, x))
+
+
+def open_lean(rows, spot, sigma):
+    """Weak direction lean from the last hour of 1-minute candles (rows are newest first).
+    Combines the last 5-minute move, the last 15-minute move and a fast-vs-slow EMA gap, each
+    measured in volatility units, then squeezes the result toward 50%: at the open the price
+    equals the strike, so no signal can be strong."""
+    closes = [r[4] for r in rows[:61]][::-1]          # oldest -> newest
+    if len(closes) < 31 or sigma <= 0:
+        return None
+
+    def move(n):
+        return _clip((spot - closes[-1 - n]) / (sigma * math.sqrt(n)))
+
+    def ema(n):
+        k, e = 2.0 / (n + 1), closes[0]
+        for c in closes[1:]:
+            e += k * (c - e)
+        return e
+
+    z5, z15 = move(5), move(15)
+    ze = _clip((ema(5) - ema(20)) / sigma)
+    score = 0.5 * z5 + 0.2 * z15 + 0.3 * ze
+    p_up = 0.5 + OPEN_TILT_MAX * math.tanh(score / 1.5)
+    return {"p_up": p_up, "score": score, "z5": z5, "z15": z15, "ema_gap": ze}
+
+
 # ---------- calibration: did the model beat the market? ----------
 class Tracker:
     def __init__(self, api):
-        self.api, self.snaps = api, {}
+        self.api, self.snaps, self.opens = api, {}, {}
         self.n, self.b_model, self.b_mid = 0, 0.0, 0.0
+        self.calls, self.hits = 0, 0
         self.lock = threading.Lock()
 
     def record(self, ticker, snap):
         self.snaps[ticker] = snap            # last in-window snapshot = final forecast
 
+    def record_open(self, ticker, call):
+        self.opens[ticker] = call
+
     def finish(self, ticker):
         snap = self.snaps.pop(ticker, None)
-        if snap:
-            threading.Thread(target=self._settle, args=(ticker, snap), daemon=True).start()
+        call = self.opens.pop(ticker, None)
+        if snap or call:
+            threading.Thread(target=self._settle, args=(ticker, snap, call), daemon=True).start()
 
-    def _settle(self, ticker, snap):
+    def _settle(self, ticker, snap, call):
         result = None
         for _ in range(16):
             time.sleep(15)
@@ -432,17 +561,29 @@ class Tracker:
         else:
             return
         y = 1.0 if result == "yes" else 0.0
-        mid = snap["mid"] if snap["mid"] is not None else 0.5
-        with self.lock:
-            self.n += 1
-            self.b_model += (snap["p_model"] - y) ** 2
-            self.b_mid += (mid - y) ** 2
-            n, bm, bk = self.n, self.b_model / self.n, self.b_mid / self.n
-        log_line(CALIB_LOG, {"t": datetime.now(timezone.utc).isoformat(), "market": ticker,
-                             "result": result, **snap})
-        print(f"[{stamp()}] settled {ticker}: {result.upper()} | model said {snap['p_model']:.0%}, "
-              f"market said {mid:.0%} | Brier so far (lower is better): model {bm:.3f} vs market {bk:.3f} "
-              f"over {n} windows")
+        rec = {"t": datetime.now(timezone.utc).isoformat(), "market": ticker, "result": result}
+        if snap:
+            mid = snap["mid"] if snap["mid"] is not None else 0.5
+            with self.lock:
+                self.n += 1
+                self.b_model += (snap["p_model"] - y) ** 2
+                self.b_mid += (mid - y) ** 2
+                n, bm, bk = self.n, self.b_model / self.n, self.b_mid / self.n
+            rec.update(snap)
+            print(f"[{stamp()}] settled {ticker}: {result.upper()} | model said {snap['p_model']:.0%}, "
+                  f"market said {mid:.0%} | Brier so far (lower is better): model {bm:.3f} vs market {bk:.3f} "
+                  f"over {n} windows")
+        if call:
+            hit = call["side"] == ("UP" if y == 1.0 else "DOWN")
+            with self.lock:
+                self.calls += 1
+                self.hits += int(hit)
+                calls, hits = self.calls, self.hits
+            rec["open_call"] = call
+            rec["open_hit"] = hit
+            print(f"[{stamp()}] open call for {ticker}: called {call['side']}, ended {result.upper()} -> "
+                  f"{'HIT' if hit else 'MISS'} | open-call record {hits}/{calls} ({hits / calls:.0%})")
+        log_line(CALIB_LOG, rec)
 
 
 # ---------- alerts, logs, state ----------
@@ -515,10 +656,11 @@ def load_state():
         return {}
 
 
-def save_state(day, traded, trades_today, start_bal):
+def save_state(day, traded, trades_today, start_bal, called=()):
     with open(STATE_FILE, "w") as f:
         json.dump({"day": str(day), "traded": sorted(traded),
-                   "trades_today": trades_today, "start_bal": start_bal}, f)
+                   "trades_today": trades_today, "start_bal": start_bal,
+                   "called": sorted(called)}, f)
 
 
 # ---------- the bot ----------
@@ -526,7 +668,9 @@ class Bot:
     def __init__(self, api, send_orders, once):
         self.api, self.send, self.once = api, send_orders, once
         self.pool = ThreadPoolExecutor(max_workers=3)
-        self.spot_pool = ThreadPoolExecutor(max_workers=len(SPOT_SOURCES))
+        self.feeds = Feeds()
+        self.watch = MarketWatcher(api)
+        self.pre_rows, self.prefetching, self._said = None, False, {}
         self.vol = Vol(self.pool)
         self.tracker = Tracker(api)
         self.market = None
@@ -540,6 +684,7 @@ class Bot:
         if st.get("day") != str(self.day):
             st = {"day": str(self.day), "traded": [], "trades_today": 0, "start_bal": None}
         self.traded = set(st["traded"])
+        self.called = set(st.get("called", []))
         self.trades_today = st["trades_today"]
         self.start_bal = st["start_bal"]
 
@@ -548,7 +693,7 @@ class Bot:
         return self.bal
 
     def save(self):
-        save_state(self.day, self.traded, self.trades_today, self.start_bal)
+        save_state(self.day, self.traded, self.trades_today, self.start_bal, self.called)
 
     def startup(self):
         if self.api.key and self.start_bal is None:
@@ -564,12 +709,36 @@ class Bot:
             return False
         return True
 
+    def _say(self, key, msg, every=5.0):
+        """Print a repeating condition at most once per `every` seconds (the loop runs 20x a second)."""
+        t = time.time()
+        if t - self._said.get(key, 0.0) >= every:
+            self._said[key] = t
+            print(f"[{stamp()}] {msg}")
+
+    def _prefetch(self):
+        try:
+            self.pre_rows = (fetch_candles(), time.time())
+        except Exception as e:
+            print(f"[{stamp()}] candle prefetch failed: {e}")
+        finally:
+            self.prefetching = False
+
+    def wait_ready(self, timeout=6.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self.feeds.quotes() and self.watch.snap[1] > 0:
+                return True
+            time.sleep(0.05)
+        return False
+
     def tick(self):
         """One check. Returns True when the bot should stop."""
         today = datetime.now(timezone.utc).date()
         if today != self.day:
             self.day, self.trades_today = today, 0
             self.traded.clear()
+            self.called.clear()
             self.start_bal = self.refresh_balance() if self.api.key else None
             self.save()
 
@@ -589,29 +758,32 @@ class Bot:
                 msg += f", balance ${self.bal:,.2f}"
             notify("Kalshi bot alive", msg)
 
-        # market quote and spot feeds are fetched at the same time
-        now = datetime.now(timezone.utc)
-        rediscover = self.market is None or parse_time(self.market["close_time"]) <= now
-        if rediscover:
-            f_mkt = self.pool.submit(self.api.open_market, SERIES)
-        else:
-            f_mkt = self.pool.submit(self.api.get_market, self.market["ticker"])
-        quotes = spot_quotes(self.spot_pool)
-        m = f_mkt.result(timeout=10)
-
-        if m is not None and m.get("status") in CLOSED_STATES:
-            m = None
+        # Everything below reads caches that background threads keep fresh: nothing waits on the network.
+        m, m_t = self.watch.snap
+        q_age = time.time() - m_t
         if self.market is not None and (m is None or m["ticker"] != self.market["ticker"]):
             self.tracker.finish(self.market["ticker"])
         self.market = m
         if m is None:
-            print(f"[{stamp()}] {LABEL}: no open {SERIES} market found")
+            self._say("nomkt", f"{LABEL}: no open {SERIES} market found (watching for the next one)")
+            return False
+        if q_age > QUOTE_MAX_AGE:
+            self._say("stale", f"{LABEL} {m['ticker']}: Kalshi quote is {q_age:.1f}s old, skipping")
+            return False
+        spot, note = combine(self.feeds.quotes())
+        if spot is None:
+            self._say("spot", f"{LABEL} {m['ticker']}: skipping, {note}")
             return False
 
-        spot, note = combine(quotes)
-        if spot is None:
-            print(f"[{stamp()}] {LABEL} {m['ticker']}: skipping, {note}")
-            return False
+        # load the candles a few seconds before the window ends, so the open call has them ready
+        if OPEN_CALL and not self.prefetching and \
+                (parse_time(m["close_time"]) - datetime.now(timezone.utc)).total_seconds() <= PREFETCH_SECS \
+                and (self.pre_rows is None or time.time() - self.pre_rows[1] > 20):
+            self.prefetching = True
+            self.pool.submit(self._prefetch)
+
+        if OPEN_CALL and m["ticker"] not in self.called:
+            self.open_call(m, spot, datetime.now(timezone.utc))
 
         now = datetime.now(timezone.utc)
         action, info, snap = decide(m, spot, self.vol.get(spot), now)
@@ -624,10 +796,53 @@ class Bot:
             and time.time() >= next_try
         if will_act or time.time() - self.last_log >= LOG_EVERY_SECS:
             self.last_log = time.time()
-            print(f"[{stamp()}] {LABEL} {tk} spot={spot:,.2f} ({note}) strike={m.get('floor_strike')} | {info}")
+            print(f"[{stamp()}] {LABEL} {tk} spot={spot:,.2f} ({note}) strike={m.get('floor_strike')} | {info} | quote {q_age * 1000:.0f}ms old")
         if will_act:
             self.act(m, action, spot, now, tries)
         return False
+
+    def open_call(self, m, spot, now):
+        """Direction call right after a new window opens. Alert only; never places an order."""
+        tk = m["ticker"]
+        secs_left = (parse_time(m["close_time"]) - now).total_seconds()
+        age = WINDOW_SECS - secs_left
+        if age > OPEN_CALL_MAX_AGE or age < -5:
+            return                              # started mid-window: no stale "open" call
+        strike = m.get("floor_strike")
+        if strike is None:
+            return                              # strike not published yet; try again next check
+        try:
+            rows = self.pre_rows[0] if (self.pre_rows and time.time() - self.pre_rows[1] <= 20) else fetch_candles()
+            lean = open_lean(rows, spot, self.vol.get(spot))
+        except Exception as e:
+            print(f"[{stamp()}] open call for {tk} failed, will retry: {e}")
+            return
+        if lean is None:
+            return
+        ya, yb, na = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars"), num(m, "no_ask_dollars")
+        mid = (ya + yb) / 2 if 0 < yb <= ya < 1 else None
+        p = lean["p_up"] if mid is None else MODEL_WEIGHT * lean["p_up"] + (1 - MODEL_WEIGHT) * mid
+        side = "UP" if p > 0.5 else "DOWN" if p < 0.5 else ("UP" if lean["score"] >= 0 else "DOWN")
+        conf = p if side == "UP" else 1 - p
+        dev = conf - 0.5
+        strength = ("very weak lean, near a coin flip" if dev < 0.02
+                    else "weak lean" if dev < 0.04 else "modest lean")
+        call = {"side": side, "conf": round(conf, 4), "strength": strength, "spot": spot,
+                "strike": float(strike), "mid": mid, "secs_after_open": round(age),
+                **{k: round(v, 3) for k, v in lean.items()}}
+        self.called.add(tk)
+        self.tracker.record_open(tk, call)
+        self.save()
+        kalshi_side = "YES" if side == "UP" else "NO"
+        print(f"[{stamp()}] OPEN CALL {LABEL} {tk}: {side} ({kalshi_side}) {conf:.0%} - {strength} | "
+              f"spot={spot:,.2f} strike={float(strike):,.2f}")
+        notify(f"Kalshi {LABEL} OPEN CALL: {side}",
+               f"New 15-min {LABEL} market just opened. Call: ends {side} (buy {kalshi_side}), "
+               f"about {conf:.0%}, {strength}.\n"
+               f"Strike ${float(strike):,.2f}, spot ${spot:,.2f}. Closes in {secs_left / 60:.0f} min.\n"
+               f"Kalshi now: YES ask {ya * 100:.0f}c / NO ask {na * 100:.0f}c.\n"
+               f"At the open price is right at the strike, so this is a small momentum lean, not a "
+               f"sure thing. This is an alert only; no order was placed.")
 
     def act(self, m, action, spot, now, tries):
         tk = m["ticker"]
@@ -645,13 +860,15 @@ class Bot:
             self.traded.add(tk)
             self.save()
             return
+        t_order = time.time()
         res = self.api.place(tk, action["side"], action["price"], action["count"])
+        rt_ms = (time.time() - t_order) * 1000
         try:
             filled = float(res.get("fill_count") or 0)
         except (TypeError, ValueError):
             filled = 0.0
         print(f"[{stamp()}] ORDER {desc} -> filled {res.get('fill_count')} "
-              f"of {action['count']}, remaining {res.get('remaining_count')}")
+              f"of {action['count']}, remaining {res.get('remaining_count')} | order round trip {rt_ms:.0f}ms")
         log_line(TRADE_LOG, {"t": now.isoformat(), "market": tk, "action": action,
                              "spot": spot, "response": res})
         if filled > 0:
@@ -675,6 +892,10 @@ class Bot:
     def run(self):
         if not self.startup():
             return
+        self.feeds.start()
+        self.watch.start()
+        if not self.wait_ready():
+            print(f"[{stamp()}] warning: prices or Kalshi not answering yet; will keep trying")
         while True:
             t0 = time.time()
             try:
