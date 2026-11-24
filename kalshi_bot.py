@@ -48,6 +48,18 @@ Open call (new)
   Each call is graded when the window settles and a running hit rate is printed and logged
   in kalshi_calibration.jsonl. The trading signals later in the window are unchanged.
 
+Scalp and end calls (new)
+  Every trading signal is now labeled:
+    SCALP = early in the window (6+ minutes left), when the Kalshi price usually has time to move
+            toward the model's fair value. The alert gives an entry, a take-profit and a stop, and
+            the bot then watches the live price and sends TAKE PROFIT or STOP the moment either
+            level is reached.
+    HOLD TO END = later signals, meant to be held until the window settles.
+  END CALL: once the model is confident (75%+) which side the window will finish on, it sends
+  the side, the confidence, how far spot is from the strike and the typical swing left. If the
+  call flips later, it sends a new one. Scalp and end calls are ALERTS ONLY: the bot never sells.
+  Both are graded at settlement and logged in kalshi_calibration.jsonl.
+
 Modes (safe by default)
   python kalshi_bot_v2.py            DRY RUN: reads markets, logs decisions, places NO orders
   python kalshi_bot_v2.py --demo     sends orders to Kalshi's DEMO environment (fake money)
@@ -156,6 +168,13 @@ OPEN_CALL = True           # send a direction call when a new market opens (aler
 WINDOW_SECS = 900          # length of one market
 OPEN_CALL_MAX_AGE = 90     # only call if the market opened less than this many seconds ago
 OPEN_TILT_MAX = 0.06       # biggest lean momentum may add to 50% (kept small on purpose)
+SCALP_CALLS = True         # label early signals SCALP (quick in-and-out) with a take-profit and a stop
+SCALP_MIN_SECS = 360       # a signal with at least this many seconds left is a SCALP; later ones are HOLD TO END
+SCALP_CAPTURE = 0.6        # take-profit = entry + this share of the gap up to the model's fair value
+SCALP_MIN_PROFIT = 0.04    # no scalp label if the take-profit would gain less than this per contract
+SCALP_STOP = 0.07          # stop = entry minus this
+END_CALLS = True           # alert which side the window will finish on once the model is confident
+END_CALL_MIN_CONF = 0.75   # confidence needed to send an END CALL
 CLOSED_STATES = {"closed", "settled", "finalized", "determined", "inactive"}
 
 
@@ -495,8 +514,15 @@ def decide(m, spot, sigma, now):
     count = int(STAKE_USD // cost)
     if count < 1:
         return None, info + " | stake too small for one contract", snap
+    fair = p if name == "UP" else 1 - p
+    kind, target, stop = "HOLD", None, None
+    if SCALP_CALLS and secs >= SCALP_MIN_SECS:
+        t = min(0.97, cost + SCALP_CAPTURE * (fair - cost))
+        if t - cost >= SCALP_MIN_PROFIT:
+            kind, target, stop = "SCALP", round(t, 2), round(max(0.02, cost - SCALP_STOP), 2)
     return {"name": name, "side": side, "price": order_price, "count": count,
-            "cost": cost, "edge": edge}, info, snap
+            "cost": cost, "edge": edge, "kind": kind, "target": target, "stop": stop,
+            "fair": round(fair, 4)}, info, snap
 
 
 def _clip(x, lim=3.0):
@@ -528,12 +554,24 @@ def open_lean(rows, spot, sigma):
     return {"p_up": p_up, "score": score, "z5": z5, "z15": z15, "ema_gap": ze}
 
 
+def plan_text(a):
+    """One-line plan for a signal: SCALP gets entry/target/stop, anything else is held to the end."""
+    if a.get("kind") == "SCALP":
+        return (f"SCALP CALL (quick in-and-out): enter about {a['cost'] * 100:.0f}c, take profit when you can "
+                f"sell near {a['target'] * 100:.0f}c, cut it if it falls to about {a['stop'] * 100:.0f}c. "
+                f"The price should move toward fair value (~{a['fair'] * 100:.0f}c) well before the close.")
+    return "HOLD TO END (no early exit planned): meant to be held until the window settles."
+
+
 # ---------- calibration: did the model beat the market? ----------
 class Tracker:
     def __init__(self, api):
         self.api, self.snaps, self.opens = api, {}, {}
         self.n, self.b_model, self.b_mid = 0, 0.0, 0.0
         self.calls, self.hits = 0, 0
+        self.ends, self.scalps = {}, {}
+        self.end_n, self.end_hits = 0, 0
+        self.sc_n, self.sc_target, self.sc_stop, self.sc_open = 0, 0, 0, 0
         self.lock = threading.Lock()
 
     def record(self, ticker, snap):
@@ -542,13 +580,21 @@ class Tracker:
     def record_open(self, ticker, call):
         self.opens[ticker] = call
 
+    def record_end(self, ticker, call):
+        self.ends[ticker] = call             # latest end call wins if it flips
+
+    def record_scalp(self, ticker, sc):
+        self.scalps[ticker] = sc             # live dict: its state keeps updating until settlement
+
     def finish(self, ticker):
         snap = self.snaps.pop(ticker, None)
         call = self.opens.pop(ticker, None)
-        if snap or call:
-            threading.Thread(target=self._settle, args=(ticker, snap, call), daemon=True).start()
+        end = self.ends.pop(ticker, None)
+        scalp = self.scalps.pop(ticker, None)
+        if snap or call or end or scalp:
+            threading.Thread(target=self._settle, args=(ticker, snap, call, end, scalp), daemon=True).start()
 
-    def _settle(self, ticker, snap, call):
+    def _settle(self, ticker, snap, call, end=None, scalp=None):
         result = None
         for _ in range(16):
             time.sleep(15)
@@ -583,6 +629,32 @@ class Tracker:
             rec["open_hit"] = hit
             print(f"[{stamp()}] open call for {ticker}: called {call['side']}, ended {result.upper()} -> "
                   f"{'HIT' if hit else 'MISS'} | open-call record {hits}/{calls} ({hits / calls:.0%})")
+        if end:
+            ehit = end["side"] == ("UP" if y == 1.0 else "DOWN")
+            with self.lock:
+                self.end_n += 1
+                self.end_hits += int(ehit)
+                en, eh = self.end_n, self.end_hits
+            rec["end_call"], rec["end_hit"] = end, ehit
+            print(f"[{stamp()}] end call for {ticker}: called {end['side']} ({end['conf']:.0%}), ended {result.upper()} -> "
+                  f"{'HIT' if ehit else 'MISS'} | end-call record {eh}/{en} ({eh / en:.0%})")
+        if scalp:
+            won = scalp["side"] == ("UP" if y == 1.0 else "DOWN")
+            with self.lock:
+                self.sc_n += 1
+                if scalp["state"] == "target":
+                    self.sc_target += 1
+                elif scalp["state"] == "stop":
+                    self.sc_stop += 1
+                else:
+                    self.sc_open += 1
+                tot, tg, st, op = self.sc_n, self.sc_target, self.sc_stop, self.sc_open
+            rec["scalp"] = dict(scalp)
+            rec["scalp_side_won"] = won
+            how = {"target": "TARGET HIT", "stop": "STOP HIT"}.get(
+                scalp["state"], "neither level hit; " + ("would have won at the end" if won else "would have lost at the end"))
+            print(f"[{stamp()}] scalp for {ticker}: {scalp['side']} entry {scalp['entry']:.2f}, target {scalp['target']:.2f}, "
+                  f"stop {scalp['stop']:.2f} -> {how} | scalps: {tg} target, {st} stop, {op} neither of {tot}")
         log_line(CALIB_LOG, rec)
 
 
@@ -675,6 +747,7 @@ class Bot:
         self.tracker = Tracker(api)
         self.market = None
         self.attempts = {}                     # ticker -> (tries, next_try_time)
+        self.scalps, self.end_sent = {}, {}    # ticker -> open scalp / last end-call side
         self.last_log = 0.0
         self.last_heartbeat = time.time()
         self.bal, self.bal_t = None, 0.0
@@ -790,6 +863,10 @@ class Bot:
         tk = m["ticker"]
         if snap:
             self.tracker.record(tk, snap)
+            if END_CALLS:
+                self.end_call(m, snap, spot, now)
+        if SCALP_CALLS:
+            self.scalp_watch(m, now)
 
         tries, next_try = self.attempts.get(tk, (0, 0.0))
         will_act = bool(action) and tk not in self.traded and self.trades_today < MAX_TRADES_PER_DAY \
@@ -798,8 +875,84 @@ class Bot:
             self.last_log = time.time()
             print(f"[{stamp()}] {LABEL} {tk} spot={spot:,.2f} ({note}) strike={m.get('floor_strike')} | {info} | quote {q_age * 1000:.0f}ms old")
         if will_act:
-            self.act(m, action, spot, now, tries)
+            if self.act(m, action, spot, now, tries) and SCALP_CALLS and action.get("kind") == "SCALP":
+                self.scalp_start(tk, action, now)
         return False
+
+    def end_call(self, m, snap, spot, now):
+        """Alert which side the window should finish on once the model is confident. Alert only."""
+        tk = m["ticker"]
+        p = snap["p_blend"]
+        side = "UP" if p >= 0.5 else "DOWN"
+        conf = p if side == "UP" else 1 - p
+        if conf < END_CALL_MIN_CONF:
+            return
+        prev = self.end_sent.get(tk)
+        if prev == side:
+            return                                  # already told them
+        self.end_sent[tk] = side
+        secs = snap["secs_left"]
+        swing = snap["sigma"] * math.sqrt(eff_minutes(secs))
+        gap = spot - snap["strike"]
+        call = {"side": side, "conf": round(conf, 4), "spot": spot, "strike": snap["strike"],
+                "secs_left": secs, "flipped": prev is not None}
+        self.tracker.record_end(tk, call)
+        kalshi_side = "YES" if side == "UP" else "NO"
+        ya, na = snap["yes_ask"], num(m, "no_ask_dollars")
+        head = "END CALL FLIPPED" if prev is not None else "END CALL"
+        print(f"[{stamp()}] {head} {LABEL} {tk}: finishes {side} ({kalshi_side}) {conf:.0%} | "
+              f"spot={spot:,.2f} strike={snap['strike']:,.2f} ({gap:+,.0f}) {secs:.0f}s left")
+        notify(f"Kalshi {LABEL} {head}: {side}",
+               f"Expect this 15-min {LABEL} window to finish {side} (buy {kalshi_side}), about {conf:.0%} sure.\n"
+               f"Spot ${spot:,.2f} is ${abs(gap):,.0f} {'above' if gap >= 0 else 'below'} the "
+               f"${snap['strike']:,.2f} strike with {secs / 60:.1f} min left. "
+               f"A typical swing from here is about ${swing:,.0f}.\n"
+               f"Kalshi now: YES ask {ya * 100:.0f}c / NO ask {na * 100:.0f}c. "
+               f"Alert only; this call places no order.")
+
+    @staticmethod
+    def exit_price(m, side):
+        """What you could sell the position for right now: the bid on the side you hold."""
+        if side == "UP":
+            yb = num(m, "yes_bid_dollars")
+            return yb if yb > 0 else None
+        nb = num(m, "no_bid_dollars")
+        if nb > 0:
+            return nb
+        ya = num(m, "yes_ask_dollars")
+        return (1 - ya) if 0 < ya < 1 else None
+
+    def scalp_start(self, tk, a, now):
+        self.scalps[tk] = {"side": a["name"], "entry": a["cost"], "target": a["target"],
+                           "stop": a["stop"], "state": "open", "t0": now.isoformat()}
+        self.tracker.record_scalp(tk, self.scalps[tk])
+
+    def scalp_watch(self, m, now):
+        """Watch an open scalp and alert the moment the take-profit or the stop is reached."""
+        tk = m["ticker"]
+        sc = self.scalps.get(tk)
+        if not sc or sc["state"] != "open":
+            return
+        px = self.exit_price(m, sc["side"])
+        if px is None:
+            return
+        kalshi_side = "YES" if sc["side"] == "UP" else "NO"
+        mins = (parse_time(m["close_time"]) - now).total_seconds() / 60
+        delta = (px - sc["entry"]) * 100
+        if px >= sc["target"]:
+            sc["state"], sc["exit"] = "target", px
+            print(f"[{stamp()}] SCALP TAKE PROFIT {tk}: {kalshi_side} bid {px:.2f} >= target {sc['target']:.2f}")
+            notify(f"Kalshi {LABEL} SCALP: TAKE PROFIT {sc['side']}",
+                   f"Your {kalshi_side} scalp reached its target. You can sell near {px * 100:.0f}c "
+                   f"(entered about {sc['entry'] * 100:.0f}c, roughly {delta:+.0f}c per contract before fees). "
+                   f"{mins:.1f} min left.\nAlert only; sell it yourself in the Kalshi app.")
+        elif px <= sc["stop"]:
+            sc["state"], sc["exit"] = "stop", px
+            print(f"[{stamp()}] SCALP STOP {tk}: {kalshi_side} bid {px:.2f} <= stop {sc['stop']:.2f}")
+            notify(f"Kalshi {LABEL} SCALP: STOP {sc['side']}",
+                   f"Your {kalshi_side} scalp hit its stop. Selling now would be near {px * 100:.0f}c "
+                   f"(entered about {sc['entry'] * 100:.0f}c, roughly {delta:+.0f}c per contract before fees). "
+                   f"{mins:.1f} min left.\nAlert only; the bot does not sell for you.")
 
     def open_call(self, m, spot, now):
         """Direction call right after a new window opens. Alert only; never places an order."""
@@ -846,20 +999,20 @@ class Bot:
 
     def act(self, m, action, spot, now, tries):
         tk = m["ticker"]
-        desc = (f"{LABEL} {action['name']} x{action['count']} @ ~{action['cost']:.2f} "
+        desc = (f"{LABEL} {action.get('kind', 'HOLD')} {action['name']} x{action['count']} @ ~{action['cost']:.2f} "
                 f"(edge {action['edge']:+.2f}) on {tk}")
         if not self.send:
             print(f"[{stamp()}] DRY RUN would place: {desc}")
             mins = (parse_time(m["close_time"]) - now).total_seconds() / 60
             kalshi_side = "YES (price goes UP)" if action["name"] == "UP" else "NO (price goes DOWN)"
-            notify(f"Kalshi {LABEL} signal",
-                   f"Buy {kalshi_side} on the 15-min {LABEL} market. "
+            notify(f"Kalshi {LABEL} {action.get('kind', 'HOLD')} signal",
+                   f"{plan_text(action)}\nBuy {kalshi_side} on the 15-min {LABEL} market. "
                    f"Price about {action['cost'] * 100:.0f}c, model edge {action['edge'] * 100:+.0f}c. "
                    f"Closes in {mins:.0f} min. Check the live price in the Kalshi app first; "
                    f"this alert may be a few minutes old.")
             self.traded.add(tk)
             self.save()
-            return
+            return True
         t_order = time.time()
         res = self.api.place(tk, action["side"], action["price"], action["count"])
         rt_ms = (time.time() - t_order) * 1000
@@ -879,7 +1032,7 @@ class Bot:
             except Exception:
                 pass
             notify(f"Kalshi {LABEL} order",
-                   f"{desc}\nFilled {res.get('fill_count')} of {action['count']}, "
+                   f"{desc}\n{plan_text(action)}\nFilled {res.get('fill_count')} of {action['count']}, "
                    f"remaining {res.get('remaining_count')}. Trades today: {self.trades_today}")
         else:
             tries += 1
@@ -888,6 +1041,7 @@ class Bot:
                 self.traded.add(tk)             # give up on this window
                 notify(f"Kalshi {LABEL} no fill", f"{desc}\nNothing filled after {tries} tries; skipping this window.")
         self.save()
+        return filled > 0
 
     def run(self):
         if not self.startup():
