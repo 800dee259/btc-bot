@@ -114,7 +114,7 @@ MAX_TRADES_PER_DAY = 20
 MAX_DAILY_LOSS_USD = 20.0  # stop trading if cash balance falls this far below the start
 MAX_ATTEMPTS = 3           # tries per market if orders fill nothing
 RETRY_SECS = 5             # wait between those tries
-POLL_SECS = float(os.environ.get("POLL_SECS", "2"))  # seconds between checks; set POLL_SECS=1 for faster
+POLL_SECS = float(os.environ.get("POLL_SECS", "1"))  # seconds between checks; set POLL_SECS=1 for faster
 SIGMA_REFRESH_SECS = 60    # recompute volatility this often (saves API calls)
 EWMA_LAMBDA = 0.94         # volatility decay per minute
 VOL_EWMA_WEIGHT = 0.6      # share of EWMA vs plain 1-hour realized vol
