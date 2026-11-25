@@ -425,7 +425,7 @@ def scalp_signal(m, spot, sigma, hist, now_t):
     if not (SCALP_MIN_PRICE <= cost <= SCALP_MAX_PRICE):
         return None
     edge = p_side - cost - fee(cost)
-    return {"name": name, "cost": cost, "p_side": p_side, "edge": edge,
+    return {"name": name, "cost": cost, "p_side": p_side, "p_up": p, "edge": edge,
             "target": min(0.95, cost + SCALP_TARGET), "secs": secs,
             "enter": edge >= SCALP_MIN_EDGE}
 
@@ -576,6 +576,7 @@ class Bot:
         self._err_alert = 0.0
         self.lean = {}                           # ticker -> (current side, flip count)
         self.last_scalp, self.last_pulse = {}, {}  # scalp signal timers per ticker
+        self.scalp_lean = {}                       # ticker -> (side, flip count) for scalp messages
         self.last_log, self.last_hb = 0.0, time.time()
         self.bal, self.bal_t = None, 0.0
         self.day = datetime.now(timezone.utc).date()
@@ -725,8 +726,20 @@ class Bot:
         if not s:
             return
         dot = "\U0001F7E2" if s["name"] == "UP" else "\U0001F534"
+        lean_txt, lean_side, lean_conf = lean_tag(s["p_up"])
+        prev = self.scalp_lean.get(tk)
+        flips = prev[1] if prev else 0
+        if prev and prev[0] != lean_side and lean_conf >= 0.60:
+            flips += 1
+            self.scalp_lean[tk] = (lean_side, flips)
+            if s["secs"] > MAX_SECS:       # inside the last 4 minutes the main FLIP alert handles it
+                notify(f"\U0001F504 {LABEL} FLIP", f"{lean_txt}\nFlipped {flips}x this window. {s['secs']:.0f}s left.")
+        elif not prev:
+            self.scalp_lean[tk] = (lean_side, 0)
         body = (f"{dot} {s['name']} @ {s['cost'] * 100:.0f}c | win chance {s['p_side']:.0%} | "
-                f"edge {s['edge']:+.2f}\n{s['secs']:.0f}s left | spot ${spot:,.2f} vs strike ${float(m['floor_strike']):,.2f}")
+                f"edge {s['edge']:+.2f}\nLean: {lean_txt} | flipped {flips}x\n"
+                f"Flip risk: {1 - lean_conf:.0%}\n"
+                f"{s['secs']:.0f}s left | spot ${spot:,.2f} vs strike ${float(m['floor_strike']):,.2f}")
         if s["enter"] and now_t - self.last_scalp.get(tk, 0) >= SCALP_COOLDOWN:
             self.last_scalp[tk] = now_t
             print(f"[{stamp()}] SCALP ENTER {body}")
