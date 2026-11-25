@@ -14,6 +14,9 @@ Why v3
        better than zero AND the model beats the market's own price (Brier). Otherwise it
        keeps paper-trading and sends nothing.
 
+  Scalp signals (added): repeated ENTER alerts for the low-% side across most of the window,
+  plus a regular pulse update. Alerts only, no orders.
+
 Modes
   python kalshi_bot_v3.py            DRY RUN / paper (no orders)
   python kalshi_bot_v3.py --demo     orders to Kalshi DEMO (fake money, gate ignored)
@@ -85,6 +88,16 @@ CALIB_LOG = "kalshi_v3_log.jsonl"
 STATE_FILE = "kalshi_v3_state.json"
 HEARTBEAT_SECS = 3600
 CLOSED_STATES = {"closed", "settled", "finalized", "determined", "inactive"}
+
+# ---- scalp signals (low-% side) ----
+SCALP_MIN_PRICE = 0.05   # cheapest side must cost at least this
+SCALP_MAX_PRICE = 0.35   # ...and at most this (the "low percentage" side)
+SCALP_MIN_SECS = 20      # stop signaling this close to the end
+SCALP_MAX_SECS = 840     # start signaling about 1 minute into the window
+SCALP_MIN_EDGE = 0.03    # model win chance must beat price + fee by this
+SCALP_COOLDOWN = 20      # seconds between ENTER alerts per window
+SCALP_TARGET = 0.10      # take-profit: exit when price is 10c above entry
+PULSE_SECS = 30          # status update interval when there's no entry
 
 
 def stamp():
@@ -392,6 +405,31 @@ def decide(m, spot, sigma, hist, now_t):
             "p_win": round(p if name == "UP" else 1 - p, 4)}, info, snap
 
 
+def scalp_signal(m, spot, sigma, hist, now_t):
+    """Low-% side scalp signal. Returns a dict (with 'enter' True/False) or None. Alert only."""
+    strike = m.get("floor_strike")
+    if strike is None:
+        return None
+    close_t = parse_time(m["close_time"]).timestamp()
+    secs = close_t - now_t
+    if not (SCALP_MIN_SECS <= secs <= SCALP_MAX_SECS):
+        return None
+    pm = prob_up(spot, float(strike), hist, now_t, close_t, sigma)
+    if pm is None:
+        return None
+    ya, yb, na = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars"), num(m, "no_ask_dollars")
+    if not (0 < yb <= ya < 1) or ya - yb > MAX_SPREAD:
+        return None
+    p = (1 - MARKET_WEIGHT) * pm + MARKET_WEIGHT * (ya + yb) / 2
+    name, cost, p_side = ("UP", ya, p) if ya <= na else ("DOWN", na, 1 - p)
+    if not (SCALP_MIN_PRICE <= cost <= SCALP_MAX_PRICE):
+        return None
+    edge = p_side - cost - fee(cost)
+    return {"name": name, "cost": cost, "p_side": p_side, "edge": edge,
+            "target": min(0.95, cost + SCALP_TARGET), "secs": secs,
+            "enter": edge >= SCALP_MIN_EDGE}
+
+
 # ---------- ledger: tracks every trade to settlement and runs the proof gate ----------
 class Ledger:
     def __init__(self, api):
@@ -537,6 +575,7 @@ class Bot:
         self.called, self.sat_out, self.coinflip, self.reason = set(), set(), set(), {}
         self._err_alert = 0.0
         self.lean = {}                           # ticker -> (current side, flip count)
+        self.last_scalp, self.last_pulse = {}, {}  # scalp signal timers per ticker
         self.last_log, self.last_hb = 0.0, time.time()
         self.bal, self.bal_t = None, 0.0
         self.day = datetime.now(timezone.utc).date()
@@ -638,6 +677,7 @@ class Bot:
         tk = m["ticker"]
         action, info, snap = decide(m, spot, sigma, list(self.hist), now_t)
         self.reason[tk] = info
+        self.scalp_check(m, spot, sigma, now_t)     # low-% side scalp signals (alert only)
         if not snap:
             self.sit_out(m, info)
         if snap:
@@ -677,6 +717,24 @@ class Bot:
         if will_act:
             self.act(tk, action, tries)
         return False
+
+    def scalp_check(self, m, spot, sigma, now_t):
+        """Send repeated ENTER alerts for the low-% side, plus a regular pulse. Alert only."""
+        tk = m["ticker"]
+        s = scalp_signal(m, spot, sigma, list(self.hist), now_t)
+        if not s:
+            return
+        dot = "\U0001F7E2" if s["name"] == "UP" else "\U0001F534"
+        body = (f"{dot} {s['name']} @ {s['cost'] * 100:.0f}c | win chance {s['p_side']:.0%} | "
+                f"edge {s['edge']:+.2f}\n{s['secs']:.0f}s left | spot ${spot:,.2f} vs strike ${float(m['floor_strike']):,.2f}")
+        if s["enter"] and now_t - self.last_scalp.get(tk, 0) >= SCALP_COOLDOWN:
+            self.last_scalp[tk] = now_t
+            print(f"[{stamp()}] SCALP ENTER {body}")
+            notify(f"\u26A1 {LABEL} SCALP: ENTER LOW SIDE",
+                   body + f"\nTarget exit: {s['target'] * 100:.0f}c. Alert only.")
+        elif now_t - self.last_pulse.get(tk, 0) >= PULSE_SECS:
+            self.last_pulse[tk] = now_t
+            notify(f"{LABEL} pulse", body + ("\nNo entry yet." if not s["enter"] else ""))
 
     def sit_out(self, m, reason):
         """Tell the group once per window that no call is coming yet, and why."""
