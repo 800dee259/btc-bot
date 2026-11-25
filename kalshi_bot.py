@@ -534,6 +534,8 @@ class Bot:
         self.hist = deque(maxlen=4000)           # (time, spot) every ~0.4s, about 27 minutes
         self.market, self.attempts, self._said = None, {}, {}
         self.sig_cache = (0.0, None)
+        self.called = set()
+        self._err_alert = 0.0
         self.lean = {}                           # ticker -> (current side, flip count)
         self.last_log, self.last_hb = 0.0, time.time()
         self.bal, self.bal_t = None, 0.0
@@ -636,8 +638,17 @@ class Bot:
                 n = prev[1] + 1
                 self.lean[tk] = (side_now, n)
                 print(f"[{stamp()}] \U0001F504 FLIP {tk}: now {lean_tag(snap['p_blend'])[0]} | flipped {n}x this window")
+                notify(f"\U0001F504 Kalshi {LABEL} FLIP", f"{lean_tag(snap['p_blend'])[0]}\n"
+                       f"Flipped {n}x this window. {snap['secs_left']}s left, spot ${spot:,.2f} vs strike ${snap['strike']:,.2f}.")
             elif not prev:
                 self.lean[tk] = (side_now, 0)
+            if tk not in self.called:               # one call per window, as soon as it is inside the trading window
+                self.called.add(tk)
+                ya, na = snap["yes_ask"], num(m, "no_ask_dollars")
+                notify(f"Kalshi {LABEL} CALL", f"{lean_tag(snap['p_blend'])[0]}\n"
+                       f"{snap['secs_left']}s left | spot ${spot:,.2f} vs strike ${snap['strike']:,.2f} "
+                       f"({spot - snap['strike']:+,.0f})\nKalshi: YES ask {ya * 100:.0f}c / NO ask {na * 100:.0f}c\n"
+                       f"Alert only, no order placed.")
         tries, next_try = self.attempts.get(tk, (0, 0.0))
         will_act = bool(action) and tk not in self.traded and self.trades_today < MAX_TRADES_PER_DAY \
             and now_t >= next_try
@@ -699,6 +710,9 @@ class Bot:
                     return
             except Exception as e:
                 print(f"[{stamp()}] error: {e}")
+                if time.time() - self._err_alert > 900:
+                    self._err_alert = time.time()
+                    notify("Kalshi bot error", str(e)[:300])
             if self.once:
                 return
             time.sleep(max(0.0, POLL_SECS - (time.time() - t0)))
