@@ -534,7 +534,7 @@ class Bot:
         self.hist = deque(maxlen=4000)           # (time, spot) every ~0.4s, about 27 minutes
         self.market, self.attempts, self._said = None, {}, {}
         self.sig_cache = (0.0, None)
-        self.called = set()
+        self.called, self.sat_out, self.coinflip, self.reason = set(), set(), set(), {}
         self._err_alert = 0.0
         self.lean = {}                           # ticker -> (current side, flip count)
         self.last_log, self.last_hb = 0.0, time.time()
@@ -607,7 +607,11 @@ class Bot:
 
         m, m_t = self.watch.snap
         if self.market is not None and (m is None or m["ticker"] != self.market["ticker"]):
-            self.ledger.finish(self.market["ticker"])
+            old = self.market["ticker"]
+            self.ledger.finish(old)
+            if old not in self.called:
+                notify(f"\u23F8\uFE0F Kalshi {LABEL}: SAT OUT last round",
+                       f"No call was sent for {old}. Reason: {self.reason.get(old, 'never reached the trading window')}.")
         self.market = m
         if m is None:
             self._say("nomkt", "no open market found (watching for the next one)")
@@ -615,10 +619,12 @@ class Bot:
         q_age = time.time() - m_t
         if q_age > QUOTE_MAX_AGE:
             self._say("stale", f"Kalshi quote is {q_age:.1f}s old, skipping")
+            self.sit_out(m, f"Kalshi quote is stale ({q_age:.0f}s old)")
             return False
         spot, note = combine(self.feeds.quotes())
         if spot is None:
             self._say("spot", f"skipping, {note}")
+            self.sit_out(m, note)
             return False
         now_t = time.time()
         if not self.hist or now_t - self.hist[-1][0] >= 0.4:
@@ -626,10 +632,14 @@ class Bot:
         sigma = self.sigma()
         if sigma is None:
             self._say("warm", "warming up: collecting prices for volatility (about 3 minutes)")
+            self.sit_out(m, "bot is still warming up (collecting prices)")
             return False
 
         tk = m["ticker"]
         action, info, snap = decide(m, spot, sigma, list(self.hist), now_t)
+        self.reason[tk] = info
+        if not snap:
+            self.sit_out(m, info)
         if snap:
             self.ledger.record_snap(tk, snap)
             _, side_now, conf_now = lean_tag(snap["p_blend"])
@@ -642,13 +652,22 @@ class Bot:
                        f"Flipped {n}x this window. {snap['secs_left']}s left, spot ${spot:,.2f} vs strike ${snap['strike']:,.2f}.")
             elif not prev:
                 self.lean[tk] = (side_now, 0)
+            if tk in self.coinflip and conf_now >= 0.75:
+                self.coinflip.discard(tk)
+                notify(f"\u2705 Kalshi {LABEL}: RISK DROPPED", f"{lean_tag(snap['p_blend'])[0]}\n"
+                       f"{snap['secs_left']}s left. This was a coin flip earlier; it is a firmer call now.")
             if tk not in self.called:               # one call per window, as soon as it is inside the trading window
                 self.called.add(tk)
+                flip = conf_now < 0.60
+                if flip:
+                    self.coinflip.add(tk)
                 ya, na = num(m, "yes_ask_dollars"), num(m, "no_ask_dollars")
                 notify(f"Kalshi {LABEL} CALL", f"{lean_tag(snap['p_blend'])[0]}\n"
                        f"{snap['secs_left']}s left | spot ${spot:,.2f} vs strike ${snap['strike']:,.2f} "
                        f"({spot - snap['strike']:+,.0f})\nKalshi: YES ask {ya * 100:.0f}c / NO ask {na * 100:.0f}c\n"
-                       f"Alert only, no order placed.")
+                       + ("\u23F8\uFE0F SIT OUT: this is a coin flip. Wait, risk drops later in the window; "
+                          "you will get a RISK DROPPED alert if it firms up.\n" if flip else "")
+                       + "Alert only, no order placed.")
         tries, next_try = self.attempts.get(tk, (0, 0.0))
         will_act = bool(action) and tk not in self.traded and self.trades_today < MAX_TRADES_PER_DAY \
             and now_t >= next_try
@@ -658,6 +677,18 @@ class Bot:
         if will_act:
             self.act(tk, action, tries)
         return False
+
+    def sit_out(self, m, reason):
+        """Tell the group once per window that no call is coming yet, and why."""
+        tk = m["ticker"]
+        self.reason[tk] = reason
+        secs = parse_time(m["close_time"]).timestamp() - time.time()
+        if tk in self.called or tk in self.sat_out or not (MIN_SECS < secs <= MAX_SECS):
+            return
+        self.sat_out.add(tk)
+        notify(f"\u23F8\uFE0F Kalshi {LABEL}: SITTING OUT (for now)",
+               f"No call yet, {secs:.0f}s left. Reason: {reason}.\n"
+               f"Wait: a call will be sent if the data clears before the window ends.")
 
     def stats_line(self):
         return self.ledger.stats()
