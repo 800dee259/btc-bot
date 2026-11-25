@@ -98,6 +98,8 @@ SCALP_MIN_EDGE = 0.03    # model win chance must beat price + fee by this
 SCALP_COOLDOWN = 20      # seconds between ENTER alerts per window
 SCALP_TARGET = 0.10      # take-profit: exit when price is 10c above entry
 PULSE_SECS = 30          # status update interval when there's no entry
+SURGE_MOVE = 0.35        # market price jump (35 points) from early in the window = "unexpected surge"
+SURGE_START_SECS = 600   # only measure the surge against prices seen with more than this many secs left
 
 
 def stamp():
@@ -576,6 +578,7 @@ class Bot:
         self._err_alert = 0.0
         self.lean = {}                           # ticker -> (current side, flip count)
         self.last_scalp, self.last_pulse = {}, {}  # scalp signal timers per ticker
+        self.first_mid, self.surged = {}, {}       # surge detection per ticker
         self.scalp_lean = {}                       # ticker -> (side, flip count) for scalp messages
         self.last_log, self.last_hb = 0.0, time.time()
         self.bal, self.bal_t = None, 0.0
@@ -651,7 +654,8 @@ class Bot:
             self.ledger.finish(old)
             if old not in self.called:
                 notify(f"\u23F8\uFE0F Kalshi {LABEL}: SAT OUT last round",
-                       f"No call was sent for {old}. Reason: {self.reason.get(old, 'never reached the trading window')}.")
+                       f"No call was sent for {old}. Reason: {self.reason.get(old, 'never reached the trading window')}.\n"
+                       + self.surge_note(old))
         self.market = m
         if m is None:
             self._say("nomkt", "no open market found (watching for the next one)")
@@ -678,6 +682,7 @@ class Bot:
         tk = m["ticker"]
         action, info, snap = decide(m, spot, sigma, list(self.hist), now_t)
         self.reason[tk] = info
+        self.surge_check(m)                         # detect unexpected surges (explains late calls)
         self.scalp_check(m, spot, sigma, now_t)     # low-% side scalp signals (alert only)
         if not snap:
             self.sit_out(m, info)
@@ -703,11 +708,14 @@ class Bot:
                 if flip:
                     self.coinflip.add(tk)
                 ya, na = num(m, "yes_ask_dollars"), num(m, "no_ask_dollars")
+                if tk not in self.surged and tk not in self.last_scalp and conf_now >= 0.90:
+                    self.surged[tk] = (side_now, None, snap["mid"])
                 notify(f"Kalshi {LABEL} CALL", f"{lean_tag(snap['p_blend'])[0]}\n"
                        f"{snap['secs_left']}s left | spot ${spot:,.2f} vs strike ${snap['strike']:,.2f} "
                        f"({spot - snap['strike']:+,.0f})\nKalshi: YES ask {ya * 100:.0f}c / NO ask {na * 100:.0f}c\n"
                        + ("\u23F8\uFE0F SIT OUT: this is a coin flip. Wait, risk drops later in the window; "
                           "you will get a RISK DROPPED alert if it firms up.\n" if flip else "")
+                       + self.surge_note(tk)
                        + "Alert only, no order placed.")
         tries, next_try = self.attempts.get(tk, (0, 0.0))
         will_act = bool(action) and tk not in self.traded and self.trades_today < MAX_TRADES_PER_DAY \
@@ -718,6 +726,48 @@ class Bot:
         if will_act:
             self.act(tk, action, tries)
         return False
+
+    def surge_check(self, m):
+        """Flag a sudden one-sided move so the group knows why there were no early calls."""
+        tk = m["ticker"]
+        ya, yb = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars")
+        if not (0 < yb <= ya < 1):
+            return
+        mid = (ya + yb) / 2
+        secs = parse_time(m["close_time"]).timestamp() - time.time()
+        if tk not in self.first_mid:
+            # starting price is only trusted if we saw the window early
+            self.first_mid[tk] = mid if secs > SURGE_START_SECS else None
+        first = self.first_mid[tk]
+        if tk in self.surged or secs <= MAX_SECS:
+            return
+        side = "UP" if mid >= 0.5 else "DOWN"
+        if first is not None and abs(mid - first) >= SURGE_MOVE:
+            self.surged[tk] = (side, first, mid)
+            notify(f"\U0001F680 {LABEL} SURGE {side}",
+                   f"Unexpected sudden move: market went {first:.0%} -> {mid:.0%} on UP with {secs:.0f}s left.\n"
+                   f"The price jumped too fast to enter safely, so NO early calls this round. "
+                   f"The bot will send its normal call in the last 4 minutes.")
+        elif first is None and (mid >= 0.85 or mid <= 0.15):
+            self.surged[tk] = (side, None, mid)
+            notify(f"\U0001F680 {LABEL} ONE-SIDED MARKET",
+                   f"Market is already {mid:.0%} on UP with {secs:.0f}s left. No safe entry, so NO early calls. "
+                   f"The bot will send its normal call in the last 4 minutes.")
+        else:
+            return
+        print(f"[{stamp()}] SURGE {side} {tk}: {self.surged[tk]}")
+
+    def surge_note(self, tk):
+        s = self.surged.get(tk)
+        if not s:
+            return ""
+        side, first, mid = s
+        if first is None:
+            why = f"the market moved sharply {side} early and stayed one-sided ({mid:.0%} on UP)"
+        else:
+            why = f"unexpected {side} surge, market went {first:.0%} -> {mid:.0%}"
+        return (f"\U0001F680 WHY NO EARLIER CALLS: {why}. "
+                f"There was no safe entry, so the bot sat out the round and is calling it now.\n")
 
     def scalp_check(self, m, spot, sigma, now_t):
         """Send repeated ENTER alerts for the low-% side, plus a regular pulse. Alert only."""
