@@ -644,7 +644,7 @@ class Bot:
                 self.lean[tk] = (side_now, 0)
             if tk not in self.called:               # one call per window, as soon as it is inside the trading window
                 self.called.add(tk)
-                ya, na = snap["yes_ask"], num(m, "no_ask_dollars")
+                ya, na = num(m, "yes_ask_dollars"), num(m, "no_ask_dollars")
                 notify(f"Kalshi {LABEL} CALL", f"{lean_tag(snap['p_blend'])[0]}\n"
                        f"{snap['secs_left']}s left | spot ${spot:,.2f} vs strike ${snap['strike']:,.2f} "
                        f"({spot - snap['strike']:+,.0f})\nKalshi: YES ask {ya * 100:.0f}c / NO ask {na * 100:.0f}c\n"
