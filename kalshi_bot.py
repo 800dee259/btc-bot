@@ -1,537 +1,750 @@
+#!/usr/bin/env python3
 """
-Kalshi BTC 15-minute (KXBTC15M) bot v4 -- high-conviction mode, live green/red dashboard.
+Kalshi 15-minute Bitcoin (KXBTC15M) bot, v3: trades only when it has PROVEN it beats the market.
 
-Signals blended into one probability:
-  1. Lognormal model (spot vs strike, realized vol, time left)
-  2. 60s momentum
-  3. Kalshi order-book imbalance
-  then shrunk toward the market price (guards against overconfidence).
-Trades only when edge (after fees) clears the profile's threshold.
-Every trade (live OR paper) is tracked to settlement and logged to trades.csv.
+Why v3
+  v2 sent lots of alerts (open calls, scalps, end calls) from a model that had never been shown
+  to beat Kalshi's own prices. v3 removes the noise and changes three things:
+    1. Settlement-aware model. Kalshi settles on a 60-second average. Late in the window part of
+       that average is already known; v3 uses the real recorded prices for it, then models only
+       the remaining uncertainty.
+    2. Own volatility from live ticks (last 5 and 15 minutes, takes the larger), not stale candles.
+    3. A PROOF GATE. Every would-be trade is tracked on paper through settlement with fees.
+       --live only sends real orders while the paper record is positive AND statistically
+       better than zero AND the model beats the market's own price (Brier). Otherwise it
+       keeps paper-trading and sends nothing.
 
-Risk profiles (PROFILE env var): SAFE | BALANCED | COINFLIP
-  COINFLIP = aggressive: tiny edge threshold, big sizing, multiple open trades.
-  The daily loss stop stays on in every profile.
+Modes
+  python kalshi_bot_v3.py            DRY RUN / paper (no orders)
+  python kalshi_bot_v3.py --demo     orders to Kalshi DEMO (fake money, gate ignored)
+  python kalshi_bot_v3.py --live     real orders, but only while the gate is open
+  python kalshi_bot_v3.py --stats    print the paper record and gate status, then exit
 
-Setup:
-  pip install requests cryptography
-  export KALSHI_KEY_ID=...  KALSHI_KEY_PATH=kalshi.pem
-  python kalshi_btc15_bot_v2.py
-Defaults: KALSHI_DEMO=true, DRY_RUN=true (paper trades, still settled + scored).
-Go live only with: KALSHI_DEMO=false DRY_RUN=false -- after days of paper results.
+Setup
+  pip install cryptography
+  KALSHI_KEY_ID, KALSHI_KEY_PATH (or KALSHI_PRIVATE_KEY), optional TELEGRAM_TOKEN / TELEGRAM_CHAT_ID
+
+Check the settlement rules of the market on Kalshi and set SETTLE_AVG_SECS to match.
+NOT financial advice. Most traders in these markets lose money.
 """
-import base64, csv, math, os, sys, time, uuid
+import argparse
+import base64
+import http.client
+import json
+import math
+import os
+import socket
+import statistics
+import threading
+import time
+import urllib.parse
+import urllib.request
+import uuid
 from collections import deque
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 
-import requests
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-
-# ---------------- config ----------------
-DEMO = os.getenv("KALSHI_DEMO", "true").lower() == "true"
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-PROFILE = os.getenv("PROFILE", "BALANCED").upper()
-BASE = ("https://demo-api.kalshi.co/trade-api/v2" if DEMO
-        else "https://api.elections.kalshi.com/trade-api/v2")
+PROD = "https://external-api.kalshi.com/trade-api/v2"
+DEMO = "https://external-api.demo.kalshi.co/trade-api/v2"
 SERIES = "KXBTC15M"
+LABEL = "BTC"
 
-PROFILES = {
-    #            min net edge, $/trade cap, Kelly frac, max open, loss stop $, shrink to mkt, min signals agreeing
-    "SAFE":     dict(min_edge=0.09, stake=3,  kelly=0.10, max_open=1, loss_stop=15, shrink=0.35, min_agree=2, max_flip=70, min_conv=70, persist=45, min_z=0.9, max_cross=1),
-    "BALANCED": dict(min_edge=0.06, stake=5,  kelly=0.15, max_open=2, loss_stop=25, shrink=0.25, min_agree=2, max_flip=85, min_conv=60, persist=30, min_z=0.6, max_cross=2),
-    "COINFLIP": dict(min_edge=0.03, stake=15, kelly=0.35, max_open=3, loss_stop=50, shrink=0.10, min_agree=1, max_flip=100, min_conv=45, persist=10, min_z=0.3, max_cross=3),
+SPOT_SOURCES = {
+    "coinbase": ("api.exchange.coinbase.com", "/products/BTC-USD/ticker", lambda d: float(d["price"])),
+    "kraken": ("api.kraken.com", "/0/public/Ticker?pair=XBTUSD",
+               lambda d: float(next(iter(d["result"].values()))["c"][0])),
+    "bitstamp": ("www.bitstamp.net", "/api/v2/ticker/btcusd/", lambda d: float(d["last"])),
+    "gemini": ("api.gemini.com", "/v1/pubticker/btcusd", lambda d: float(d["last"])),
 }
-PROF = PROFILES.get(PROFILE, PROFILES["BALANCED"])
+FEED_GAP = {"coinbase": 0.25, "kraken": 1.0, "bitstamp": 0.5, "gemini": 1.0}
 
-MIN_SECS_LEFT, MAX_SECS_LEFT = 90, 780   # entry window (secs before close)
-MIN_PRICE, MAX_PRICE = 0.12, 0.88
-MAX_SPREAD = 0.06                       # wide bid/ask = poor fills
-MAX_VOL_ANN = 1.5                        # skip if realized vol > 150% annualized
-MAX_SPOT_DIVERGENCE = 0.001              # skip if Coinbase vs Kraken differ > 0.1%
-POLL_SECS = 2
-VOL_WINDOW_SECS = 600
-CSV_PATH = "trades_v4.csv"
+# ---- settings ----
+STAKE_USD = 5.0
+SETTLE_AVG_SECS = 60        # VERIFY on Kalshi: seconds averaged at settlement (0 = single price)
+MIN_SECS, MAX_SECS = 15, 240  # only trade late, when the settlement average is mostly determined
+MIN_EDGE = 0.05             # blended edge after fee must beat this
+MAX_EDGE = 0.25             # larger "edges" are almost always bad data
+MIN_PRICE, MAX_PRICE = 0.10, 0.92
+MAX_SPREAD = 0.06
+MARKET_WEIGHT = 0.5         # final probability = (1-w)*model + w*market mid; shrinks model overconfidence
+VOL_MULT = 1.15             # inflate volatility a bit: overconfidence is what loses money
+BASIS_FRAC = 0.0001         # allowance for our spot differing from Kalshi's reference index
+MAX_SOURCE_DISAGREE = 0.0015
+FEE_RATE = 0.07             # taker fee ~ FEE_RATE*p*(1-p) per contract; verify on Kalshi
+POLL_SECS = 0.1
+QUOTE_GAP, BOUNDARY_GAP, BOUNDARY_SECS = 0.3, 0.1, 3
+QUOTE_MAX_AGE, FEED_MAX_AGE, REQUEST_TIMEOUT = 2.0, 3.0, 4
+MAX_TRADES_PER_DAY = 20
+MAX_DAILY_LOSS_USD = 20.0
+MAX_ATTEMPTS, RETRY_SECS = 3, 5
+BALANCE_REFRESH_SECS = 15
+# proof gate
+GATE_MIN_TRADES = 100       # paper/real trades needed before real money is allowed
+GATE_MIN_MEAN = 0.01        # average profit per contract (after fees) must exceed this...
+GATE_Z = 1.0                # ...and stay positive even one standard error lower
+CALIB_LOG = "kalshi_v3_log.jsonl"
+STATE_FILE = "kalshi_v3_state.json"
+HEARTBEAT_SECS = 3600
+CLOSED_STATES = {"closed", "settled", "finalized", "determined", "inactive"}
 
-# ---------------- ANSI ----------------
-G, R, Y, C, D, B, RST = ("\033[92m", "\033[91m", "\033[93m", "\033[96m",
-                         "\033[90m", "\033[1m", "\033[0m")
+
+def stamp():
+    return datetime.now().strftime("%H:%M:%S")
 
 
-def col(t, k): return f"{k}{t}{RST}"
-def sgn_col(x, txt): return col(txt, G if x > 0 else R if x < 0 else Y)
-def dot(ok): return col("●", G if ok else R)
-def arrow(x, dead=0): return col("▲", G) if x > dead else col("▼", R) if x < -dead else col("■", Y)
-def clamp(x, lo, hi): return max(lo, min(hi, x))
+def parse_time(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-# ---------------- Kalshi client ----------------
-class Kalshi:
-    def __init__(self):
-        self.key_id = os.environ["KALSHI_KEY_ID"]
-        with open(os.environ["KALSHI_KEY_PATH"], "rb") as f:
-            self.pk = serialization.load_pem_private_key(f.read(), password=None)
-        self.s = requests.Session()
-
-    def _headers(self, method, url):
-        ts = str(int(time.time() * 1000))
-        msg = f"{ts}{method}{urlparse(url).path}".encode()  # no query string
-        sig = self.pk.sign(msg, padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
-                                            salt_length=padding.PSS.DIGEST_LENGTH),
-                           hashes.SHA256())
-        return {"KALSHI-ACCESS-KEY": self.key_id, "KALSHI-ACCESS-TIMESTAMP": ts,
-                "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
-                "Content-Type": "application/json"}
-
-    def req(self, method, path, **kw):
-        url = BASE + path
-        r = self.s.request(method, url, headers=self._headers(method, url), timeout=10, **kw)
-        r.raise_for_status()
-        return r.json()
-
-    def balance_usd(self): return self.req("GET", "/portfolio/balance")["balance"] / 100
-
-    def open_markets(self):
-        ms = self.req("GET", "/markets", params={"series_ticker": SERIES,
-                                                 "status": "open", "limit": 5})["markets"]
-        return sorted(ms, key=lambda m: m["close_time"])
-
-    def market(self, ticker): return self.req("GET", f"/markets/{ticker}")["market"]
-
-    def book_imbalance(self, ticker):
-        """(yes_depth - no_depth)/(total) over top levels, in [-1, 1]. 0 if unavailable."""
+# ---------- HTTP with kept-alive connections ----------
+class _Conn(http.client.HTTPSConnection):
+    def connect(self):
+        super().connect()
         try:
-            ob = self.req("GET", f"/markets/{ticker}/orderbook", params={"depth": 5}).get("orderbook") or {}
-            y = sum(q for _, q in (ob.get("yes") or [])[-5:])
-            n = sum(q for _, q in (ob.get("no") or [])[-5:])
-            return (y - n) / (y + n) if (y + n) else 0.0
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+
+_tls = threading.local()
+
+
+def _conn(host):
+    conns = getattr(_tls, "conns", None)
+    if conns is None:
+        conns = _tls.conns = {}
+    if host not in conns:
+        conns[host] = _Conn(host, timeout=REQUEST_TIMEOUT)
+    return conns[host]
+
+
+def _drop(host):
+    c = getattr(_tls, "conns", {}).pop(host, None)
+    if c is not None:
+        try:
+            c.close()
         except Exception:
-            return 0.0
-
-    def buy(self, ticker, side, count, price_cents):
-        return self.req("POST", "/portfolio/orders", json={
-            "ticker": ticker, "action": "buy", "side": side, "count": count,
-            "type": "limit", "client_order_id": str(uuid.uuid4()),
-            f"{side}_price": price_cents})
+            pass
 
 
-# ---------------- data / model ----------------
-def get_spot():
-    """Average of Coinbase + Kraken. Returns (avg, coinbase, kraken, divergence)."""
-    cb = kr = None
-    try:
-        cb = float(requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot",
-                                timeout=4).json()["data"]["amount"])
-    except Exception:
-        pass
-    try:
-        kr = float(requests.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
-                                timeout=4).json()["result"]["XXBTZUSD"]["c"][0])
-    except Exception:
-        pass
-    px = [p for p in (cb, kr) if p]
-    if not px:
-        raise RuntimeError("no spot price")
-    div = abs(cb - kr) / min(cb, kr) if cb and kr else 0.0
-    return sum(px) / len(px), cb, kr, div
+def request(host, method, path, headers=None, body=None):
+    hdrs = {"User-Agent": "kalshi-bot/3.0", "Accept": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    for attempt in (0, 1):
+        try:
+            c = _conn(host)
+            c.request(method, path, body=body, headers=hdrs)
+            r = c.getresponse()
+            data = r.read()
+        except (http.client.HTTPException, OSError):
+            _drop(host)
+            if attempt:
+                raise
+            continue
+        if r.status >= 400:
+            raise RuntimeError(f"{method} {path} -> HTTP {r.status}: {data.decode(errors='replace')[:300]}")
+        return json.loads(data) if data else {}
 
 
-class PriceBuf:
-    def __init__(self): self.buf = deque()
+# ---------- Kalshi API ----------
+class Kalshi:
+    def __init__(self, base, key_id=None, key_path=None):
+        u = urllib.parse.urlparse(base)
+        self.host, self.prefix = u.netloc, u.path
+        self.key_id, self.key = key_id, None
+        if key_id and key_path:
+            from cryptography.hazmat.primitives import serialization
+            with open(key_path, "rb") as f:
+                self.key = serialization.load_pem_private_key(f.read(), password=None)
 
-    def add(self, t, p):
-        self.buf.append((t, p))
-        while self.buf and t - self.buf[0][0] > VOL_WINDOW_SECS:
-            self.buf.popleft()
+    def _sign(self, ts, method, path):
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        msg = f"{ts}{method}{path}".encode()
+        if isinstance(self.key, Ed25519PrivateKey):
+            sig = self.key.sign(msg)
+        else:
+            sig = self.key.sign(msg, padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                                                 salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
+        return base64.b64encode(sig).decode()
 
-    def sigma(self):
-        pts = list(self.buf)
-        if len(pts) < 30: return None
-        var, n = 0.0, 0
-        for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
-            if t1 > t0:
-                var += math.log(p1 / p0) ** 2 / (t1 - t0); n += 1
-        return math.sqrt(var / n) if n else None
+    def call(self, method, endpoint, params=None, body=None):
+        path = self.prefix + endpoint
+        full = path + ("?" + urllib.parse.urlencode(params) if params else "")
+        headers = {"Content-Type": "application/json"}
+        if self.key:
+            ts = str(int(time.time() * 1000))
+            headers.update({"KALSHI-ACCESS-KEY": self.key_id, "KALSHI-ACCESS-TIMESTAMP": ts,
+                            "KALSHI-ACCESS-SIGNATURE": self._sign(ts, method, path)})
+        data = json.dumps(body).encode() if body is not None else None
+        return request(self.host, method, full, headers, data)
 
-    def momentum(self, now, secs=60):
-        """Fractional price change over last `secs` (0.001 = +0.1%)."""
-        if len(self.buf) < 5: return 0.0
-        old = next((p for t, p in self.buf if now - t <= secs), self.buf[0][1])
-        return self.buf[-1][1] / old - 1
-
-    def resampled(self, now, secs=300, step=15):
-        out, last = [], None
-        for t, p in self.buf:
-            if now - t > secs: continue
-            if last is None or t - last >= step:
-                out.append(p); last = t
-        return out
-
-    def efficiency(self, now, secs=300):
-        """Net move / total path over last `secs`. ~1 = clean trend, ~0 = sideways chop."""
-        r = self.resampled(now, secs)
-        if len(r) < 8: return None
-        path = sum(abs(b - a) for a, b in zip(r, r[1:]))
-        return abs(r[-1] - r[0]) / path if path else 0.0
-
-    def crossings(self, strike, now, secs=300):
-        """How many times price crossed the strike in the last `secs`."""
-        r = self.resampled(now, secs)
-        sd = [1 if p >= strike else -1 for p in r]
-        return sum(1 for a, b in zip(sd, sd[1:]) if a != b)
-
-
-def norm_cdf(x): return 0.5 * (1 + math.erf(x / math.sqrt(2)))
-
-
-def prob_up(spot, strike, secs, sigma):
-    sigma = max(sigma, 0.00002)
-    return norm_cdf(math.log(spot / strike) / (sigma * math.sqrt(max(secs, 1))))
-
-
-def fee_per_contract(p): return 0.07 * p * (1 - p)
-
-
-def settle_pnl(side, result, count, ask):
-    fee = math.ceil(0.07 * count * ask * (1 - ask) * 100) / 100
-    won = side == result
-    return (count * (1 - ask) if won else -count * ask) - fee, won
-
-
-def parse_close(m): return datetime.fromisoformat(m["close_time"].replace("Z", "+00:00"))
-
-
-# ---------------- analysis ----------------
-def analyze(m, spot, sigma, mom, imb, now, ctx=None):
-    ctx = ctx or {}
-    strike = float(m["floor_strike"])
-    secs = (parse_close(m) - now).total_seconds()
-    p_model = prob_up(spot, strike, secs, sigma)
-    raw = clamp(p_model + clamp(mom * 20, -0.03, 0.03) + 0.03 * imb, 0.02, 0.98)
-    ya, na = m["yes_ask"] / 100, m["no_ask"] / 100
-    yb = (m.get("yes_bid") or 0) / 100
-    mid = (ya + yb) / 2 if yb else ya
-    p = (1 - PROF["shrink"]) * raw + PROF["shrink"] * mid
-    sides = {s: dict(p=pp, ask=ask, edge=pp - ask - fee_per_contract(ask))
-             for s, pp, ask in (("yes", p, ya), ("no", 1 - p, na))}
-    sig = {"model": 1 if p_model > 0.52 else -1 if p_model < 0.48 else 0,
-           "mom": 1 if mom > 0.0002 else -1 if mom < -0.0002 else 0,
-           "book": 1 if imb > 0.1 else -1 if imb < -0.1 else 0}
-    agree = {"yes": sum(v == 1 for v in sig.values()), "no": sum(v == -1 for v in sig.values())}
-    flip = 1 - abs(p - 0.5) * 2          # 1.0 = pure coin flip, 0.0 = decisive
-    spread = (ya - yb) if yb else None
-    z = math.log(spot / strike) / (max(sigma, 0.00002) * math.sqrt(max(secs, 1)))
-    return dict(er=ctx.get("er"), cross=ctx.get("cross", 0), swing=ctx.get("swing", 0.0), z=z,
-                flip=flip, spread=spread, strike=strike, secs=secs, dist=spot - strike, dist_pct=spot / strike - 1,
-                p_model=p_model, p=p, sides=sides, sig=sig, agree=agree, imb=imb)
-
-
-def add_conviction(a):
-    """0-100 score for the leaning side. Needs to clear the profile's min_conv."""
-    lean = a["lean"]
-    d = a["sides"][lean]
-    parts = {
-        "edge": min(max(d["edge"], 0) / 0.15, 1) * 25,
-        "decisive": min((1 - a["flip"]) / 0.5, 1) * 20,
-        "agree": a["agree"][lean] / 3 * 15,
-        "trend": min((a["er"] or 0) / 0.5, 1) * 15,
-        "persist": min(a["persist"] / 60, 1) * 10,
-        "no_chop": (1 - min(a["cross"] / 3, 1)) * 10,
-        "calm": (1 - min(a["swing"] / 0.20, 1)) * 5,
-    }
-    a["conv"] = sum(parts.values())
-    a["conv_parts"] = parts
-
-
-def check_gates(a, ticker, open_pos, traded, div, sigma, pnl):
-    """List of (ok, label, detail). Any failed gate => WAIT."""
-    g = []
-    g.append((sigma is not None, "Vol data", "warming up, need ~1 min of prices"))
-    ann = sigma * math.sqrt(31536000) if sigma else 0
-    g.append((ann <= MAX_VOL_ANN, "Volatility", f"spike {ann*100:.0f}% ann (> {MAX_VOL_ANN*100:.0f}%)"))
-    s = a["secs"]
-    if s > MAX_SECS_LEFT:
-        g.append((False, "Timing", f"too early, entry opens in {int(s - MAX_SECS_LEFT)}s"))
-    elif s < MIN_SECS_LEFT:
-        g.append((False, "Timing", "too close to close, wait for next window"))
-    else:
-        g.append((True, "Timing", "inside entry window"))
-    g.append((a["flip"] * 100 <= PROF["max_flip"], "Coin-flip risk",
-              f"{a['flip']*100:.0f}% (max {PROF['max_flip']}%), too close to 50/50"))
-    g.append((a["spread"] is None or a["spread"] <= MAX_SPREAD, "Spread",
-              f"{(a['spread'] or 0)*100:.0f}c wide (max {MAX_SPREAD*100:.0f}c)"))
-    g.append((div <= MAX_SPOT_DIVERGENCE, "Price feeds", "Coinbase and Kraken disagree"))
-    er = a["er"]
-    g.append((er is not None, "Regime", "need ~2 min of price history"))
-    if er is not None:
-        g.append((er >= 0.20, "Regime", f"CHOP: price going sideways (efficiency {er:.2f})"))
-    g.append((a["cross"] <= PROF["max_cross"], "Strike crosses",
-              f"price crossed strike {a['cross']}x in 5 min (max {PROF['max_cross']})"))
-    g.append((a["swing"] <= 0.15, "Market whipsaw", f"YES price swung {a['swing']*100:.0f}c in 2 min"))
-    g.append((a["lean_flips"] <= 1, "Lean flips", f"direction flipped {a['lean_flips']}x in 3 min"))
-    g.append((a["persist"] >= PROF["persist"], "Persistence",
-              f"{a['lean'].upper()} lean only {a['persist']:.0f}s old (need {PROF['persist']}s)"))
-    g.append((abs(a["z"]) >= PROF["min_z"], "Distance",
-              f"only {abs(a['z']):.2f} sigma from strike (need {PROF['min_z']})"))
-    g.append((a["conv"] >= PROF["min_conv"], "Conviction",
-              f"{a['conv']:.0f}/100 (need {PROF['min_conv']})"))
-    g.append((ticker not in traded, "Window", "already traded this window"))
-    g.append((len(open_pos) < PROF["max_open"], "Positions", "max open positions reached"))
-    g.append((pnl > -PROF["loss_stop"], "Loss stop", "daily loss limit hit"))
-    return g
-
-
-def decide(a, ticker, open_pos, traded, div, sigma, pnl):
-    """Returns (side|None, reason, status, failed_reasons). status: TRADE | WATCH | WAIT."""
-    gates = check_gates(a, ticker, open_pos, traded, div, sigma, pnl)
-    fails = [f"{lbl}: {det}" for ok, lbl, det in gates if not ok]
-    if fails:
-        return None, fails[0], "WAIT", fails
-    best = None
-    for s, d in a["sides"].items():
-        if not (MIN_PRICE <= d["ask"] <= MAX_PRICE): continue
-        if d["edge"] < PROF["min_edge"]: continue
-        if a["agree"][s] < PROF["min_agree"]: continue
-        if best is None or d["edge"] > a["sides"][best]["edge"]: best = s
-    if best and best != a["lean"]:
-        return None, f"edge on {best.upper()} conflicts with {a['lean'].upper()} lean, no call", "WATCH", []
-    if best:
-        return best, f"CALL {best.upper()}: conviction {a['conv']:.0f}/100", "TRADE", []
-    return None, "conditions OK but no edge yet, watching", "WATCH", []
-
-
-def flip_bar(flip, width=10):
-    n = int(round(flip * width))
-    k = R if flip * 100 >= 85 else Y if flip * 100 >= 60 else G
-    return col("█" * n + "░" * (width - n), k)
-
-
-# ---------------- bot ----------------
-class Bot:
-    def __init__(self):
-        self.k = Kalshi()
-        self.pb = PriceBuf()
-        self.start_bal = self.k.balance_usd()
-        self.bal = self.start_bal
-        self.bal_t = time.time()
-        self.open_pos, self.traded, self.done = [], set(), []
-        self.pnl = 0.0
-        self.events = deque(maxlen=6)
-        self.qh, self.lean = {}, {}
-        self.last_spot = None
-        if not os.path.exists(CSV_PATH):
-            with open(CSV_PATH, "w", newline="") as f:
-                csv.writer(f).writerow(["time", "ticker", "side", "count", "ask", "model_p",
-                                        "edge", "result", "won", "pnl", "mode", "conviction", "regime"])
-
-    def log(self, msg, k=Y): self.events.append(f"{D}{datetime.now():%H:%M:%S}{RST} {col(msg, k)}")
-
-    def settle(self):
+    def open_market(self, series):
+        res = self.call("GET", "/markets", {"series_ticker": series, "status": "open", "limit": 20})
         now = datetime.now(timezone.utc)
-        for pos in list(self.open_pos):
-            if (now - pos["close"]).total_seconds() < 5: continue
+        live = [m for m in res.get("markets", []) if parse_time(m["close_time"]) > now]
+        live.sort(key=lambda m: m["close_time"])
+        return live[0] if live else None
+
+    def get_market(self, ticker):
+        return self.call("GET", f"/markets/{ticker}")["market"]
+
+    def balance_usd(self):
+        return self.call("GET", "/portfolio/balance")["balance"] / 100.0
+
+    def place(self, ticker, side, price, count):
+        body = {"ticker": ticker, "side": side, "count": f"{count:.2f}", "price": f"{price:.4f}",
+                "time_in_force": "immediate_or_cancel", "self_trade_prevention_type": "taker_at_cross",
+                "client_order_id": str(uuid.uuid4())}
+        return self.call("POST", "/portfolio/events/orders", body=body)
+
+
+# ---------- background data ----------
+class Feeds:
+    def __init__(self):
+        self.latest, self.stop = {}, threading.Event()
+
+    def start(self):
+        for name in SPOT_SOURCES:
+            threading.Thread(target=self._loop, args=(name,), daemon=True).start()
+
+    def _loop(self, name):
+        host, path, parse = SPOT_SOURCES[name]
+        gap = FEED_GAP.get(name, 1.0)
+        while not self.stop.is_set():
+            t0 = time.time()
             try:
-                m = self.k.market(pos["ticker"])
+                self.latest[name] = (parse(request(host, "GET", path)), time.time())
+            except Exception:
+                self.stop.wait(2.0)
+            self.stop.wait(max(0.0, gap - (time.time() - t0)))
+
+    def quotes(self):
+        now = time.time()
+        return {n: p for n, (p, t) in list(self.latest.items()) if now - t <= FEED_MAX_AGE}
+
+
+class MarketWatcher:
+    def __init__(self, api):
+        self.api, self.snap, self.stop = api, (None, 0.0), threading.Event()
+        self.no_mkt_since, self._err_t = None, 0.0
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def step(self):
+        gap, cur, now = QUOTE_GAP, self.snap[0], datetime.now(timezone.utc)
+        if cur is None or parse_time(cur["close_time"]) <= now:
+            m, gap = self.api.open_market(SERIES), BOUNDARY_GAP
+        else:
+            m = self.api.get_market(cur["ticker"])
+            if (parse_time(m["close_time"]) - now).total_seconds() <= BOUNDARY_SECS:
+                gap = BOUNDARY_GAP
+        if m is not None and m.get("status") in CLOSED_STATES:
+            m = None
+        if m is None:
+            self.no_mkt_since = self.no_mkt_since or time.time()
+            if time.time() - self.no_mkt_since > 20:
+                gap = 1.0
+        else:
+            self.no_mkt_since = None
+        self.snap = (m, time.time())
+        return gap
+
+    def _loop(self):
+        while not self.stop.is_set():
+            t0 = time.time()
+            try:
+                gap = self.step()
+            except Exception as e:
+                gap = 0.5
+                if time.time() - self._err_t > 10:
+                    self._err_t = time.time()
+                    print(f"[{stamp()}] Kalshi quote error: {e}")
+            self.stop.wait(max(0.0, gap - (time.time() - t0)))
+
+
+def combine(quotes):
+    vals = [v for v in quotes.values() if v and v > 0]
+    if not vals:
+        return None, "no spot data"
+    med = statistics.median(vals)
+    vals = [v for v in vals if abs(v - med) / med <= 0.005]
+    spot = statistics.median(vals)
+    if len(vals) > 1 and (max(vals) - min(vals)) / spot > MAX_SOURCE_DISAGREE:
+        return None, f"exchange prices disagree ({min(vals):,.0f}-{max(vals):,.0f})"
+    return spot, f"{len(vals)}/{len(SPOT_SOURCES)} feeds"
+
+
+# ---------- model ----------
+def realized_sigma(hist, window, step=10.0):
+    """Dollar volatility per sqrt(second) from our own recorded prices over the last `window` secs."""
+    if not hist:
+        return None
+    now, pts, last = hist[-1][0], [], None
+    for t, p in hist:
+        if t < now - window:
+            continue
+        if last is None or t - last >= step:
+            pts.append((t, p))
+            last = t
+    if len(pts) < 12:
+        return None
+    r = [(b[1] - a[1]) / math.sqrt(b[0] - a[0]) for a, b in zip(pts, pts[1:])]
+    return math.sqrt(sum(x * x for x in r) / len(r))
+
+
+def t4_cdf(x):
+    u = 1 + x * x / 4.0
+    return 0.5 + 0.375 * (x / math.sqrt(u)) * (1 - (x * x / u) / 12.0)
+
+
+def settle_distribution(spot, hist, now_t, close_t, sigma):
+    """Mean and variance of the final settlement value (the average of the last SETTLE_AVG_SECS).
+    The part of that average that has already happened is taken from recorded prices."""
+    s, W = close_t - now_t, float(SETTLE_AVG_SECS)
+    if W <= 0:
+        return spot, sigma ** 2 * s
+    if s >= W:
+        return spot, sigma ** 2 * ((s - W) + W / 3.0)
+    pts = [p for t, p in hist if close_t - W <= t <= now_t]
+    if len(pts) < 5:
+        return None
+    a_obs = sum(pts) / len(pts)
+    mean = ((W - s) * a_obs + s * spot) / W
+    return mean, (s / W) ** 2 * sigma ** 2 * s / 3.0
+
+
+def prob_up(spot, strike, hist, now_t, close_t, sigma):
+    d = settle_distribution(spot, hist, now_t, close_t, sigma * VOL_MULT)
+    if d is None:
+        return None
+    mean, var = d
+    sd = math.sqrt(var + (BASIS_FRAC * spot) ** 2)
+    p = t4_cdf((mean - strike) / sd * math.sqrt(2))     # t4 has variance 2: rescale to unit variance
+    return min(0.97, max(0.03, p))
+
+
+def fee(p):
+    return FEE_RATE * p * (1 - p)
+
+
+def lean_tag(p_up):
+    """Green/red indicator plus how close the call is to a coin flip.
+    Returns (text, side, win_chance). 'risk' = chance the call is wrong."""
+    side = "UP" if p_up >= 0.5 else "DOWN"
+    conf = p_up if side == "UP" else 1 - p_up
+    dot = "\U0001F7E2" if side == "UP" else "\U0001F534"
+    label = ("COIN FLIP" if conf < 0.60 else "RISKY" if conf < 0.75
+             else "LEANING" if conf < 0.90 else "STRONG")
+    return f"{dot} {side} {conf:.0%} ({label}, {1 - conf:.0%} risk)", side, conf
+
+
+def num(m, key):
+    try:
+        return float(m.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def decide(m, spot, sigma, hist, now_t):
+    """Returns (action or None, info, snapshot or None)."""
+    strike = m.get("floor_strike")
+    if strike is None:
+        return None, "no strike yet", None
+    strike = float(strike)
+    close_t = parse_time(m["close_time"]).timestamp()
+    secs = close_t - now_t
+    if not (MIN_SECS <= secs <= MAX_SECS):
+        return None, f"outside trading window ({secs:.0f}s left)", None
+    p_model = prob_up(spot, strike, hist, now_t, close_t, sigma)
+    if p_model is None:
+        return None, "not enough recorded prices yet", None
+    ya, yb, na = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars"), num(m, "no_ask_dollars")
+    mid = (ya + yb) / 2 if 0 < yb <= ya < 1 else None
+    if mid is None:
+        return None, "no two-sided book", None
+    p = (1 - MARKET_WEIGHT) * p_model + MARKET_WEIGHT * mid
+    snap = {"secs_left": round(secs), "spot": spot, "strike": strike, "p_model": round(p_model, 4),
+            "p_blend": round(p, 4), "mid": mid, "sigma": round(sigma, 3)}
+    info = f"{lean_tag(p)[0]} | {secs:.0f}s model={p_model:.0%} mid={mid:.0%} blend={p:.0%} gap=${spot - strike:+,.0f}"
+    if ya - yb > MAX_SPREAD:
+        return None, info + f" | spread {ya - yb:.2f} too wide", snap
+    opts = []
+    if MIN_PRICE <= ya <= MAX_PRICE:
+        opts.append(("UP", "bid", ya, ya, p - ya - fee(ya), p_model - ya - fee(ya)))
+    if MIN_PRICE <= na <= MAX_PRICE:
+        opts.append(("DOWN", "ask", yb, na, (1 - p) - na - fee(na), (1 - p_model) - na - fee(na)))
+    if not opts:
+        return None, info + " | price too extreme", snap
+    name, side, order_price, cost, edge, raw_edge = max(opts, key=lambda o: o[4])
+    info += f" | best={name} edge={edge:+.2f}"
+    if edge < MIN_EDGE or raw_edge < MIN_EDGE:         # blended AND raw model must both clear the bar
+        return None, info + " | no trade", snap
+    if raw_edge > MAX_EDGE:
+        return None, info + " | edge too large, likely bad data", snap
+    count = int(STAKE_USD // cost)
+    if count < 1:
+        return None, info + " | stake too small", snap
+    return {"name": name, "side": side, "price": order_price, "count": count,
+            "cost": round(cost, 4), "edge": round(edge, 4),
+            "p_win": round(p if name == "UP" else 1 - p, 4)}, info, snap
+
+
+# ---------- ledger: tracks every trade to settlement and runs the proof gate ----------
+class Ledger:
+    def __init__(self, api):
+        self.api, self.lock = api, threading.Lock()
+        self.snaps, self.trades = {}, {}
+        self.pnl, self.bm, self.bk, self.nb = [], 0.0, 0.0, 0
+        try:
+            with open(CALIB_LOG) as f:
+                for line in f:
+                    r = json.loads(line)
+                    if r.get("pnl") is not None:
+                        self.pnl.append(r["pnl"])
+                    if "p_model" in r and r.get("y") is not None:
+                        self._brier(r["p_model"], r["mid"], r["y"])
+        except Exception:
+            pass
+
+    def _brier(self, pm, mid, y):
+        self.nb += 1
+        self.bm += (pm - y) ** 2
+        self.bk += (mid - y) ** 2
+
+    def record_snap(self, tk, snap):
+        if snap["secs_left"] <= 120 and tk not in self.snaps:
+            self.snaps[tk] = snap               # one comparable forecast per window, ~2 min out
+
+    def add_trade(self, tk, a):
+        self.trades[tk] = dict(a)
+
+    def stats(self):
+        with self.lock:
+            n = len(self.pnl)
+            mean = sum(self.pnl) / n if n else 0.0
+            se = (statistics.stdev(self.pnl) / math.sqrt(n)) if n > 1 else float("inf")
+            bm = self.bm / self.nb if self.nb else None
+            bk = self.bk / self.nb if self.nb else None
+        return n, mean, se, bm, bk
+
+    def gate(self):
+        n, mean, se, bm, bk = self.stats()
+        if n < GATE_MIN_TRADES:
+            return False, f"need {GATE_MIN_TRADES} tracked trades, have {n}"
+        if mean - GATE_Z * se <= GATE_MIN_MEAN:
+            return False, f"avg {mean * 100:+.1f}c/contract (+/-{se * 100:.1f}c) is not clearly profitable"
+        if bm is None or bm >= bk:
+            return False, "model does not beat the market's own price (Brier)"
+        return True, f"avg {mean * 100:+.1f}c/contract over {n} trades"
+
+    def finish(self, tk):
+        snap, trade = self.snaps.pop(tk, None), self.trades.pop(tk, None)
+        if snap or trade:
+            threading.Thread(target=self._settle, args=(tk, snap, trade), daemon=True).start()
+
+    def _settle(self, tk, snap, trade):
+        result = None
+        for _ in range(20):
+            time.sleep(15)
+            try:
+                result = self.api.get_market(tk).get("result")
             except Exception:
                 continue
-            if m.get("result") in ("yes", "no"):
-                pnl, won = settle_pnl(pos["side"], m["result"], pos["count"], pos["ask"])
-                pos.update(pnl=pnl, won=won, result=m["result"])
-                self.pnl += pnl
-                self.open_pos.remove(pos); self.done.append(pos)
-                self.log(f"SETTLED {pos['side'].upper()} x{pos['count']} -> "
-                         f"{'WIN' if won else 'LOSS'} ${pnl:+.2f}", G if won else R)
-                with open(CSV_PATH, "a", newline="") as f:
-                    csv.writer(f).writerow([datetime.now().isoformat(timespec="seconds"),
-                                            pos["ticker"], pos["side"], pos["count"],
-                                            pos["ask"], round(pos["p"], 4), round(pos["edge"], 4),
-                                            m["result"], won, round(pnl, 2),
-                                            "paper" if DRY_RUN else "live",
-                                            round(pos.get("conv", 0)), pos.get("regime")])
+            if result in ("yes", "no"):
+                break
+        else:
+            return
+        y = 1.0 if result == "yes" else 0.0
+        rec = {"t": datetime.now(timezone.utc).isoformat(), "market": tk, "result": result, "y": y}
+        if snap:
+            rec.update(snap)
+            with self.lock:
+                self._brier(snap["p_model"], snap["mid"], y)
+        if trade:
+            win = (trade["name"] == "UP") == (y == 1.0)
+            pnl = (1.0 if win else 0.0) - trade["cost"] - fee(trade["cost"])
+            rec["trade"], rec["pnl"] = trade, round(pnl, 4)
+            with self.lock:
+                self.pnl.append(pnl)
+        log_line(CALIB_LOG, rec)
+        n, mean, se, bm, bk = self.stats()
+        msg = f"settled {tk}: {result.upper()}"
+        if trade:
+            msg += f" | {trade['name']} {'WON' if rec['pnl'] > 0 else 'LOST'} {rec['pnl'] * 100:+.0f}c/contract"
+        msg += f" | record: {n} trades, avg {mean * 100:+.1f}c"
+        if bm is not None:
+            msg += f" | Brier model {bm:.3f} vs market {bk:.3f}"
+        print(f"[{stamp()}] {msg}")
 
-    def enter(self, m, a, side):
-        d = a["sides"][side]
-        bankroll = self.start_bal + self.pnl
-        kelly = max(0.0, (d["p"] - d["ask"]) / (1 - d["ask"]))
-        usd = min(PROF["stake"], bankroll * PROF["kelly"] * kelly)
-        count = int(usd // d["ask"])
-        if count < 1: return
-        if not DRY_RUN:
-            self.k.buy(m["ticker"], side, count, int(round(d["ask"] * 100)))
-        self.traded.add(m["ticker"])
-        self.open_pos.append(dict(ticker=m["ticker"], side=side, count=count, ask=d["ask"],
-                                  p=d["p"], edge=d["edge"], close=parse_close(m),
-                                  conv=a["conv"], regime=a["regime"]))
-        self.log(f"{'PAPER' if DRY_RUN else 'BUY'} {side.upper()} x{count} @ {d['ask']*100:.0f}c "
-                 f"edge {d['edge']*100:+.1f}% conv {a['conv']:.0f}", C)
 
-    def read_market(self, m, spot, sigma, mom, imb, now):
-        """Build the full 'market read': regime, whipsaw, lean persistence, conviction."""
-        t = time.time()
-        strike = float(m["floor_strike"])
-        ya = m["yes_ask"] / 100
-        yb = (m.get("yes_bid") or 0) / 100
-        mid = (ya + yb) / 2 if yb else ya
-        h = self.qh.setdefault(m["ticker"], deque())
-        h.append((t, mid))
-        while h and t - h[0][0] > 120: h.popleft()
-        swing = max(x for _, x in h) - min(x for _, x in h)
-        ctx = dict(er=self.pb.efficiency(t), cross=self.pb.crossings(strike, t), swing=swing)
-        a = analyze(m, spot, sigma or 0.0001, mom, imb, now, ctx)
-        st = self.lean.get(m["ticker"])
-        side = "yes" if a["p"] >= 0.5 else "no"
-        if st is not None and abs(a["p"] - 0.5) < 0.02:
-            side = st["side"]                      # deadband: don't flip on noise
-        if st is None:
-            st = self.lean[m["ticker"]] = dict(side=side, since=t, flips=deque())
-        elif st["side"] != side:
-            st["side"], st["since"] = side, t
-            st["flips"].append(t)
-        while st["flips"] and t - st["flips"][0] > 180: st["flips"].popleft()
-        a.update(lean=side, persist=t - st["since"], lean_flips=len(st["flips"]))
-        er = a["er"]
-        a["regime"] = ("WARMING" if er is None else "CHOP" if er < 0.20
-                       else "TREND" if er >= 0.35 else "MIXED")
-        add_conviction(a)
-        return a
+# ---------- alerts / logs / state ----------
+def log_line(path, rec):
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
 
-    def banner(self, info):
-        if not info:
-            return col("█ WAIT ", R) + " no open market yet"
-        for m, a, side, why, status, fails in info:
-            if status == "TRADE":
-                return (col(f"█ CALL: BUY {side.upper()} ", G)
-                        + f"conviction {a['conv']:.0f}/100, edge {a['sides'][side]['edge']*100:+.1f}%")
-        for m, a, side, why, status, fails in info:
-            if status == "WATCH":
-                return col("█ WATCHING ", Y) + "good conditions, waiting for an edge"
-        fails = info[0][5]
-        extra = f" (+{len(fails)-1} more)" if len(fails) > 1 else ""
-        return col("█ NOT A GOOD TIME, WAIT ", R) + f"{fails[0]}{extra}"
 
-    def render(self, spot, cb, kr, div, sigma, mom, markets_info):
-        w = sum(1 for p in self.done if p["won"]); n = len(self.done)
-        out = ["\033[H\033[J"]
-        mode = col("PAPER", Y) if DRY_RUN else col("LIVE $$", R)
-        env = col("DEMO", Y) if DEMO else col("PROD", R)
-        out.append(f"{B}KALSHI BTC-15M BOT{RST}  {mode} {env}  profile={col(PROFILE, C)}")
-        out.append("─" * 62)
-        out.append(self.banner(markets_info))
-        out.append("─" * 62)
-        cb_t = "{:,.0f}".format(cb) if cb else "n/a"
-        kr_t = "{:,.0f}".format(kr) if kr else "n/a"
-        out.append(f"BTC {B}${spot:,.2f}{RST}  CB {cb_t}  "
-                   f"KR {kr_t}  feed {dot(div <= MAX_SPOT_DIVERGENCE)} "
-                   f"({div*100:.3f}% apart)")
-        vol_txt = f"{sigma*math.sqrt(31536000)*100:.0f}% ann" if sigma else "warming up..."
-        mom_txt = "{:+.3f}%".format(mom * 100)
-        out.append(f"Vol {vol_txt}   Mom60s {sgn_col(mom, mom_txt)} {arrow(mom, 0.0002)}")
-        out.append("─" * 62)
-        for m, a, side, why, status, fails in markets_info:
-            mm, ss = divmod(int(max(a['secs'], 0)), 60)
-            pos_txt = col("ABOVE strike", G) if a["dist"] >= 0 else col("BELOW strike", R)
-            out.append(f"{B}{m['ticker']}{RST}  closes in {mm:02d}:{ss:02d}")
-            dist_txt = "{:+,.0f}$".format(a["dist"])
-            out.append(f" Strike ${a['strike']:,.2f}  {sgn_col(a['dist'], dist_txt)} "
-                       f"({a['dist_pct']*100:+.3f}%)  {pos_txt}")
-            for s in ("yes", "no"):
-                d = a["sides"][s]
-                ok = d["edge"] >= PROF["min_edge"]
-                edge_txt = "{:+5.1f}%".format(d["edge"] * 100)
-                out.append(f" {s.upper():3} ask {d['ask']*100:3.0f}c  model {d['p']*100:5.1f}%  "
-                           f"edge {sgn_col(d['edge'], edge_txt)} {dot(ok)}  "
-                           f"agree {a['agree'][s]}/3")
-            sg = a["sig"]
-            out.append(f" Signals: model {arrow(sg['model'])}  mom {arrow(sg['mom'])}  "
-                       f"book {arrow(sg['book'])} ({a['imb']:+.2f})  raw model {a['p_model']*100:.1f}%")
-            rk = {"TREND": G, "CHOP": R, "MIXED": Y, "WARMING": Y}[a["regime"]]
-            er_t = "n/a" if a["er"] is None else "{:.2f}".format(a["er"])
-            reg_t = col(a["regime"], rk)
-            out.append(f" Regime {reg_t}  eff {er_t}  strike-crosses {a['cross']}  "
-                       f"YES swing {a['swing']*100:.0f}c/2m")
-            ln_ok = a["persist"] >= PROF["persist"] and a["lean_flips"] <= 1
-            lean_t = col(a["lean"].upper(), G if a["lean"] == "yes" else R)
-            out.append(f" Lean {lean_t} held {a['persist']:.0f}s  flips {a['lean_flips']}  "
-                       f"z {a['z']:+.2f}  {dot(ln_ok)}")
-            cv_k = G if a["conv"] >= PROF["min_conv"] else R
-            nb = max(0, min(10, int(round(a["conv"] / 10))))
-            cv_t = col("{:.0f}/100".format(a["conv"]), cv_k)
-            cv_bar = col("█" * nb + "░" * (10 - nb), cv_k)
-            out.append(f" Conviction {cv_t} {cv_bar} {D}need {PROF['min_conv']}{RST}")
-            fk = R if a["flip"] * 100 >= 85 else Y if a["flip"] * 100 >= 60 else G
-            lbl = "very likely a coin flip" if fk == R else "uncertain" if fk == Y else "clear lean"
-            flip_txt = "{:.0f}%".format(a["flip"] * 100)
-            out.append(f" Coin-flip risk {col(flip_txt, fk)} "
-                       f"{flip_bar(a['flip'])} {D}{lbl}{RST}")
-            if status == "TRADE":
-                act = col(f"BUY {side.upper()}", G)
-            elif status == "WATCH":
-                act = col("WATCH", Y)
-            else:
-                act = col("WAIT", R)
-            out.append(f" Decision: {act}  {D}{why}{RST}")
-            out.append("")
-        out.append("─" * 62)
-        wr = f"{w/n*100:.0f}%" if n else "n/a"
-        pnl_txt = "${:+.2f}".format(self.pnl)
-        out.append(f"Session P&L {sgn_col(self.pnl, pnl_txt)}  "
-                   f"W/L {col(w, G)}/{col(n-w, R)}  win rate {wr}  "
-                   f"open {len(self.open_pos)}/{PROF['max_open']}  "
-                   f"bal ${self.bal:,.2f}")
-        out.append(f"Loss stop: -${PROF['loss_stop']}   "
-                   f"{dot(self.pnl > -PROF['loss_stop'])} within limit")
-        for p in self.open_pos:
-            out.append(f" {col('OPEN', C)} {p['side'].upper()} x{p['count']} @ {p['ask']*100:.0f}c "
-                       f"({p['ticker'][-12:]})")
-        out.append("─" * 62)
-        out.extend(self.events)
-        print("\n".join(out), flush=True)
+_pending = []
+
+
+def notify(title, message, block=False):
+    token, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if not (token and chat):
+        return
+
+    def send():
+        for cid in [c.strip() for c in chat.split(",") if c.strip()]:
+            try:
+                body = json.dumps({"chat_id": cid, "text": f"{title}\n{message}"}).encode()
+                urllib.request.urlopen(urllib.request.Request(
+                    f"https://api.telegram.org/bot{token}/sendMessage", data=body, method="POST",
+                    headers={"Content-Type": "application/json"}), timeout=10).close()
+            except Exception as e:
+                print(f"[{stamp()}] could not send alert: {e}")
+
+    if block:
+        send()
+    else:
+        t = threading.Thread(target=send, daemon=True)
+        t.start()
+        _pending.append(t)
+
+
+def flush_alerts(timeout=15):
+    end = time.time() + timeout
+    for t in _pending:
+        t.join(max(0.0, end - time.time()))
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+# ---------- the bot ----------
+class Bot:
+    def __init__(self, api, send_orders, gated, once):
+        self.api, self.send, self.gated, self.once = api, send_orders, gated, once
+        self.feeds, self.watch, self.ledger = Feeds(), MarketWatcher(api), Ledger(api)
+        self.hist = deque(maxlen=4000)           # (time, spot) every ~0.4s, about 27 minutes
+        self.market, self.attempts, self._said = None, {}, {}
+        self.sig_cache = (0.0, None)
+        self.lean = {}                           # ticker -> (current side, flip count)
+        self.last_log, self.last_hb = 0.0, time.time()
+        self.bal, self.bal_t = None, 0.0
+        self.day = datetime.now(timezone.utc).date()
+        st = load_state()
+        if st.get("day") != str(self.day):
+            st = {"day": str(self.day), "traded": [], "trades_today": 0, "start_bal": None}
+        self.traded, self.trades_today, self.start_bal = set(st["traded"]), st["trades_today"], st["start_bal"]
+
+    def save(self):
+        with open(STATE_FILE, "w") as f:
+            json.dump({"day": str(self.day), "traded": sorted(self.traded),
+                       "trades_today": self.trades_today, "start_bal": self.start_bal}, f)
+
+    def refresh_balance(self):
+        self.bal, self.bal_t = self.api.balance_usd(), time.time()
+        return self.bal
+
+    def _say(self, key, msg, every=5.0):
+        if time.time() - self._said.get(key, 0.0) >= every:
+            self._said[key] = time.time()
+            print(f"[{stamp()}] {msg}")
+
+    def sigma(self):
+        t, v = self.sig_cache
+        if time.time() - t < 3.0:
+            return v
+        h = list(self.hist)
+        a, b = realized_sigma(h, 900), realized_sigma(h, 300)
+        v = max(a, b) if a and b else None       # take the larger: err toward less confidence
+        if v is not None:
+            spot = h[-1][1]
+            v = min(max(v, 0.00002 * spot), 0.0003 * spot)
+        self.sig_cache = (time.time(), v)
+        return v
+
+    def startup(self):
+        if self.api.key:
+            try:
+                if self.start_bal is None:
+                    self.start_bal = self.refresh_balance()
+                print(f"[{stamp()}] starting balance ${self.start_bal:,.2f}")
+            except Exception as e:
+                print(f"[{stamp()}] could not read balance: {e}")
+        self.save()
+        if self.send and self.start_bal is None:
+            print("Refusing to send orders without a readable balance (needed for the loss limit).")
+            return False
+        return True
+
+    def tick(self):
+        today = datetime.now(timezone.utc).date()
+        if today != self.day:
+            self.day, self.trades_today = today, 0
+            self.traded.clear()
+            self.start_bal = self.refresh_balance() if self.api.key else None
+            self.save()
+        if self.send and self.start_bal is not None:
+            if self.bal is None or time.time() - self.bal_t > BALANCE_REFRESH_SECS:
+                self.refresh_balance()
+            if self.bal <= self.start_bal - MAX_DAILY_LOSS_USD:
+                print(f"[{stamp()}] daily loss limit reached (${self.bal:,.2f}). Stopping.")
+                notify("Kalshi bot STOPPED: daily loss limit", f"Balance ${self.bal:,.2f}", block=True)
+                return True
+        if not self.once and time.time() - self.last_hb >= HEARTBEAT_SECS:
+            self.last_hb = time.time()
+            n, mean, se, bm, bk = self.stats_line()
+            notify("Kalshi bot alive", f"{self.trades_today} trades today | {n} tracked, avg {mean * 100:+.1f}c/contract")
+
+        m, m_t = self.watch.snap
+        if self.market is not None and (m is None or m["ticker"] != self.market["ticker"]):
+            self.ledger.finish(self.market["ticker"])
+        self.market = m
+        if m is None:
+            self._say("nomkt", "no open market found (watching for the next one)")
+            return False
+        q_age = time.time() - m_t
+        if q_age > QUOTE_MAX_AGE:
+            self._say("stale", f"Kalshi quote is {q_age:.1f}s old, skipping")
+            return False
+        spot, note = combine(self.feeds.quotes())
+        if spot is None:
+            self._say("spot", f"skipping, {note}")
+            return False
+        now_t = time.time()
+        if not self.hist or now_t - self.hist[-1][0] >= 0.4:
+            self.hist.append((now_t, spot))
+        sigma = self.sigma()
+        if sigma is None:
+            self._say("warm", "warming up: collecting prices for volatility (about 3 minutes)")
+            return False
+
+        tk = m["ticker"]
+        action, info, snap = decide(m, spot, sigma, list(self.hist), now_t)
+        if snap:
+            self.ledger.record_snap(tk, snap)
+            _, side_now, conf_now = lean_tag(snap["p_blend"])
+            prev = self.lean.get(tk)
+            if prev and prev[0] != side_now and conf_now >= 0.60:
+                n = prev[1] + 1
+                self.lean[tk] = (side_now, n)
+                print(f"[{stamp()}] \U0001F504 FLIP {tk}: now {lean_tag(snap['p_blend'])[0]} | flipped {n}x this window")
+            elif not prev:
+                self.lean[tk] = (side_now, 0)
+        tries, next_try = self.attempts.get(tk, (0, 0.0))
+        will_act = bool(action) and tk not in self.traded and self.trades_today < MAX_TRADES_PER_DAY \
+            and now_t >= next_try
+        if will_act or now_t - self.last_log >= 15:
+            self.last_log = now_t
+            print(f"[{stamp()}] {tk} spot={spot:,.2f} ({note}) strike={m.get('floor_strike')} | {info}")
+        if will_act:
+            self.act(tk, action, tries)
+        return False
+
+    def stats_line(self):
+        return self.ledger.stats()
+
+    def act(self, tk, a, tries):
+        dot = "\U0001F7E2" if a["name"] == "UP" else "\U0001F534"
+        tag = lean_tag(a["p_win"] if a["name"] == "UP" else 1 - a["p_win"])[0]
+        desc = f"{dot} {a['name']} x{a['count']} @ ~{a['cost']:.2f} (edge {a['edge']:+.2f}) on {tk} | {tag}"
+        live_ok, why = (True, "") if not (self.send and self.gated) else self.ledger.gate()
+        if not self.send or not live_ok:
+            mode_tag = "PAPER" if self.send else "DRY RUN"
+            self._say("gate" + tk, f"{mode_tag}: {desc}" + ("" if live_ok else f" | gate closed: {why}"), every=60)
+            self.ledger.add_trade(tk, a)
+            self.traded.add(tk)
+            self.save()
+            notify(f"Kalshi {mode_tag} signal", desc)
+            return
+        res = self.api.place(tk, a["side"], a["price"], a["count"])
+        try:
+            filled = float(res.get("fill_count") or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        print(f"[{stamp()}] ORDER {desc} -> filled {res.get('fill_count')} of {a['count']}")
+        log_line(CALIB_LOG, {"t": datetime.now(timezone.utc).isoformat(), "market": tk, "order": a, "response": res})
+        if filled > 0:
+            self.ledger.add_trade(tk, a)
+            self.traded.add(tk)
+            self.trades_today += 1
+            try:
+                self.refresh_balance()
+            except Exception:
+                pass
+            notify("Kalshi order", f"{desc}\nFilled {res.get('fill_count')} of {a['count']}. Gate: {why or 'open'}")
+        else:
+            tries += 1
+            self.attempts[tk] = (tries, time.time() + RETRY_SECS)
+            if tries >= MAX_ATTEMPTS:
+                self.traded.add(tk)
+        self.save()
 
     def run(self):
+        if not self.startup():
+            return
+        self.feeds.start()
+        self.watch.start()
         while True:
+            t0 = time.time()
             try:
-                now = datetime.now(timezone.utc)
-                spot, cb, kr, div = get_spot()
-                self.pb.add(time.time(), spot)
-                sigma, mom = self.pb.sigma(), self.pb.momentum(time.time())
-                if time.time() - self.bal_t > 60:
-                    try: self.bal = self.k.balance_usd(); self.bal_t = time.time()
-                    except Exception: pass
-                self.settle()
-
-                if self.pnl <= -PROF["loss_stop"]:
-                    self.log("LOSS STOP HIT -- no new trades", R)
-                info = []
-                if True:
-                    for m in self.k.open_markets()[:2]:
-                        if m.get("floor_strike") is None: continue
-                        a = self.read_market(m, spot, sigma, mom, self.k.book_imbalance(m["ticker"]), now)
-                        side, why, status, fails = decide(a, m["ticker"], self.open_pos,
-                                                          self.traded, div, sigma, self.pnl)
-                        if side: self.enter(m, a, side)
-                        info.append((m, a, side, why, status, fails))
-                top = info[0][4] if info else "WAIT"
-                if top != getattr(self, "last_status", None):
-                    self.last_status = top
-                    reason = info[0][3] if info else "no market"
-                    self.log(f"Status -> {top}: {reason}",
-                             G if top == "TRADE" else Y if top == "WATCH" else R)
-                self.render(spot, cb, kr, div, sigma, mom, info)
-            except KeyboardInterrupt:
-                raise
-            except requests.RequestException as e:
-                self.log(f"API/network: {e}", R)
+                if self.tick():
+                    return
             except Exception as e:
-                self.log(f"error: {e}", R)
-            time.sleep(POLL_SECS)
+                print(f"[{stamp()}] error: {e}")
+            if self.once:
+                return
+            time.sleep(max(0.0, POLL_SECS - (time.time() - t0)))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--demo", action="store_true")
+    g.add_argument("--live", action="store_true")
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--stats", action="store_true")
+    a = ap.parse_args()
+    if a.stats:
+        n, mean, se, bm, bk = Ledger(None).stats()
+        ok, why = Ledger(None).gate()
+        print(f"tracked trades: {n} | avg {mean * 100:+.2f}c/contract after fees (+/-{se * 100:.2f}c)")
+        print(f"Brier: model {bm if bm is None else round(bm, 4)} vs market {bk if bk is None else round(bk, 4)}")
+        print(f"live gate: {'OPEN' if ok else 'CLOSED'} ({why})")
+        return
+    key_id, key_path = os.environ.get("KALSHI_KEY_ID"), os.environ.get("KALSHI_KEY_PATH")
+    key_text = os.environ.get("KALSHI_PRIVATE_KEY")
+    if key_id and key_text and not key_path:
+        key_path = "kalshi_key.pem"
+        with open(key_path, "w") as f:
+            f.write(key_text.replace("\\n", "\n").strip() + "\n")
+        os.chmod(key_path, 0o600)
+    if (a.demo or a.live) and not (key_id and key_path):
+        raise SystemExit("Set KALSHI_KEY_ID and KALSHI_KEY_PATH first.")
+    if a.live and input("LIVE mode places REAL orders (only while the proof gate is open). Type YES: ") != "YES":
+        return
+    api = Kalshi(PROD if not a.demo else DEMO, key_id, key_path)
+    mode = "LIVE (gated)" if a.live else "DEMO" if a.demo else "DRY RUN (paper only)"
+    print(f"Kalshi bot v3 ({SERIES}) | mode: {mode} | stake ${STAKE_USD:.2f}")
+    if not a.once:
+        notify("Kalshi bot v3 started", f"Mode: {mode}")
+    try:
+        Bot(api, send_orders=a.demo or a.live, gated=a.live, once=a.once).run()
+    except KeyboardInterrupt:
+        notify("Kalshi bot stopped", "Stopped manually.", block=True)
+    except Exception as e:
+        notify("Kalshi bot CRASHED", f"{type(e).__name__}: {str(e)[:300]}", block=True)
+        raise
+    finally:
+        flush_alerts()
 
 
 if __name__ == "__main__":
-    bot = Bot()
-    try:
-        bot.run()
-    except KeyboardInterrupt:
-        n = len(bot.done); w = sum(1 for p in bot.done if p["won"])
-        print(f"\nStopped. {n} settled trades, {w} wins, P&L ${bot.pnl:+.2f}. Log: {CSV_PATH}")
-        sys.exit(0)
+    main()
