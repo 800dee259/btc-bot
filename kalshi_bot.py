@@ -444,12 +444,36 @@ def scalp_signal(m, spot, sigma, hist, now_t):
             "enter": edge >= SCALP_MIN_EDGE}
 
 
+def mark(ok):
+    return "\u2705" if ok else "\u274C"
+
+
+def streak_text(seq):
+    """seq is a list of 1 (win) / 0 (loss) in order. Returns e.g. '12W-8L (60%) | \U0001F525 3 win streak (best 6)'."""
+    n = len(seq)
+    if not n:
+        return "no results yet"
+    w = sum(seq)
+    run, last = 0, seq[-1]
+    for x in reversed(seq):
+        if x != last:
+            break
+        run += 1
+    best = cur = 0
+    for x in seq:
+        cur = cur + 1 if x == 1 else 0
+        best = max(best, cur)
+    now = f"\U0001F525 {run} win streak" if last == 1 else f"{run} loss streak"
+    return f"{w}W-{n - w}L ({w / n:.0%}) | {now} (best {best})"
+
+
 # ---------- ledger: tracks every trade to settlement and runs the proof gate ----------
 class Ledger:
     def __init__(self, api):
         self.api, self.lock = api, threading.Lock()
         self.snaps, self.trades, self.opens = {}, {}, {}
         self.open_n, self.open_hit = 0, 0
+        self.calls, self.call_seq, self.scalp_seq = {}, [], []
         self.pnl, self.bm, self.bk, self.nb = [], 0.0, 0.0, 0
         try:
             with open(CALIB_LOG) as f:
@@ -457,6 +481,10 @@ class Ledger:
                     r = json.loads(line)
                     if r.get("pnl") is not None:
                         self.pnl.append(r["pnl"])
+                    if r.get("call_hit") is not None:
+                        self.call_seq.append(int(r["call_hit"]))
+                    if r.get("scalp_hit") is not None:
+                        self.scalp_seq.append(int(r["scalp_hit"]))
                     if r.get("open_hit") is not None:
                         self.open_n += 1
                         self.open_hit += int(r["open_hit"])
@@ -473,6 +501,18 @@ class Ledger:
     def record_snap(self, tk, snap):
         if snap["secs_left"] <= 120 and tk not in self.snaps:
             self.snaps[tk] = snap               # one comparable forecast per window, ~2 min out
+
+    def add_call(self, tk, side, conf):
+        self.calls[tk] = {"side": side, "conf": round(conf, 4)}
+
+    def record_scalp(self, tk, hit, how):
+        """Log a finished scalp (take-profit = win, cut = loss, or judged at settlement). Returns record text."""
+        with self.lock:
+            self.scalp_seq.append(1 if hit else 0)
+            txt = streak_text(self.scalp_seq)
+        log_line(CALIB_LOG, {"t": datetime.now(timezone.utc).isoformat(), "market": tk,
+                             "scalp_hit": 1 if hit else 0, "how": how})
+        return txt
 
     def add_open(self, tk, side, conf):
         self.opens[tk] = {"side": side, "conf": round(conf, 4)}
@@ -503,12 +543,13 @@ class Ledger:
             return False, "model does not beat the market's own price (Brier)"
         return True, f"avg {mean * 100:+.1f}c/contract over {n} trades"
 
-    def finish(self, tk):
+    def finish(self, tk, open_scalp=None):
         snap, trade, opn = self.snaps.pop(tk, None), self.trades.pop(tk, None), self.opens.pop(tk, None)
-        if snap or trade or opn:
-            threading.Thread(target=self._settle, args=(tk, snap, trade, opn), daemon=True).start()
+        call = self.calls.pop(tk, None)
+        if snap or trade or opn or call or open_scalp:
+            threading.Thread(target=self._settle, args=(tk, snap, trade, opn, call, open_scalp), daemon=True).start()
 
-    def _settle(self, tk, snap, trade, opn=None):
+    def _settle(self, tk, snap, trade, opn=None, call=None, open_scalp=None):
         result = None
         for _ in range(20):
             time.sleep(15)
@@ -532,7 +573,15 @@ class Ledger:
             rec["trade"], rec["pnl"] = trade, round(pnl, 4)
             with self.lock:
                 self.pnl.append(pnl)
-        open_msg = None
+        lines = []
+        if call:
+            chit = (call["side"] == "UP") == (y == 1.0)
+            rec["call"], rec["call_hit"] = call, int(chit)
+            with self.lock:
+                self.call_seq.append(int(chit))
+                ctxt = streak_text(self.call_seq)
+            lines.append(f"{mark(chit)} Call: {call['side']} at {call['conf']:.0%} "
+                         f"{'WON' if chit else 'LOST'} (ended {result.upper()})\nCalls: {ctxt}")
         if opn:
             hit = (opn["side"] == "UP") == (y == 1.0)
             rec["open_call"], rec["open_hit"] = opn, int(hit)
@@ -540,13 +589,18 @@ class Ledger:
                 self.open_n += 1
                 self.open_hit += int(hit)
                 oh, on = self.open_hit, self.open_n
-            open_msg = (f"{opn['side']} call at {opn['conf']:.0%} confidence {'HIT' if hit else 'MISSED'}. "
-                        f"Ended {result.upper()}. Opening-call record: {oh}/{on} ({oh / on:.0%})")
+            lines.append(f"{mark(hit)} Opening call: {opn['side']} at {opn['conf']:.0%} "
+                         f"{'HIT' if hit else 'MISSED'}\nOpening calls: {oh}/{on} ({oh / on:.0%})")
+        if open_scalp:
+            shit = (open_scalp["name"] == "UP") == (y == 1.0)
+            stxt = self.record_scalp(tk, shit, "settlement")
+            lines.append(f"{mark(shit)} Scalp held to settlement: {open_scalp['name']} "
+                         f"{'WON' if shit else 'LOST'}\nScalps: {stxt}")
         log_line(CALIB_LOG, rec)
-        if open_msg:
-            print(f"[{stamp()}] opening call: {open_msg}")
-            mark = "\u2705" if hit else "\u274C"
-            notify(f"{mark} {LABEL} opening call result", open_msg)
+        if lines:
+            report = "\n".join(lines)
+            print(f"[{stamp()}] ROUND RESULT {tk}: " + report.replace("\n", " | "))
+            notify(f"\U0001F4CA {LABEL} round result", report)
         n, mean, se, bm, bk = self.stats()
         msg = f"settled {tk}: {result.upper()}"
         if trade:
@@ -687,12 +741,13 @@ class Bot:
         if not self.once and time.time() - self.last_hb >= HEARTBEAT_SECS:
             self.last_hb = time.time()
             n, mean, se, bm, bk = self.stats_line()
-            notify("Kalshi bot alive", f"{self.trades_today} trades today | {n} tracked, avg {mean * 100:+.1f}c/contract")
+            notify("Kalshi bot alive", f"{self.trades_today} trades today | {n} tracked, avg {mean * 100:+.1f}c/contract\n"
+                   f"Calls: {streak_text(self.ledger.call_seq)}\nScalps: {streak_text(self.ledger.scalp_seq)}")
 
         m, m_t = self.watch.snap
         if self.market is not None and (m is None or m["ticker"] != self.market["ticker"]):
             old = self.market["ticker"]
-            self.ledger.finish(old)
+            self.ledger.finish(old, self.scalp_pos.pop(old, None))
             if old not in self.called:
                 notify(f"\u23F8\uFE0F Kalshi {LABEL}: SAT OUT last round",
                        f"No call was sent for {old}. Reason: {self.reason.get(old, 'never reached the trading window')}.\n"
@@ -748,6 +803,7 @@ class Bot:
                        f"{snap['secs_left']}s left. This was a coin flip earlier; it is a firmer call now.")
             if tk not in self.called:               # one call per window, as soon as it is inside the trading window
                 self.called.add(tk)
+                self.ledger.add_call(tk, side_now, conf_now)
                 flip = conf_now < 0.60
                 if flip:
                     self.coinflip.add(tk)
@@ -952,16 +1008,18 @@ class Bot:
                 adv = f"Steady {name} trend, so it could run further, but profit is in hand. Take it, or hold with care."
             else:
                 adv = "Take it. Don't chase more."
+            rec_txt = self.ledger.record_scalp(tk, True, "take_profit")
             notify(f"\U0001F4B0 {LABEL} TAKE PROFIT: sell {name} now",
                    f"Exit ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c per contract).\n{adv}\n"
-                   f"{secs:.0f}s left. Alert only.")
+                   f"{secs:.0f}s left. Scalps: {rec_txt}. Alert only.")
             print(f"[{stamp()}] TAKE PROFIT {name} {tk} exit={exit_bid:.2f} entry={cost:.2f}")
             self.scalp_pos.pop(tk, None)
             return
         if pnl <= -SCALP_STOP:
+            rec_txt = self.ledger.record_scalp(tk, False, "cut")
             notify(f"\U0001F6D1 {LABEL} CUT: {name} is going against you",
                    f"Exit ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c per contract).\n"
-                   f"Market: {self.regime_label()}. Consider cutting the loss. Alert only.")
+                   f"Market: {self.regime_label()}. Consider cutting the loss. Scalps: {rec_txt}. Alert only.")
             print(f"[{stamp()}] CUT {name} {tk} exit={exit_bid:.2f} entry={cost:.2f}")
             self.scalp_pos.pop(tk, None)
             return
@@ -1071,6 +1129,9 @@ def main():
         print(f"Brier: model {bm if bm is None else round(bm, 4)} vs market {bk if bk is None else round(bk, 4)}")
         oh, on = Ledger(None).open_stats()
         print(f"opening calls: {oh}/{on} correct")
+        lg = Ledger(None)
+        print(f"calls: {streak_text(lg.call_seq)}")
+        print(f"scalps: {streak_text(lg.scalp_seq)}")
         print(f"live gate: {'OPEN' if ok else 'CLOSED'} ({why})")
         return
     key_id, key_path = os.environ.get("KALSHI_KEY_ID"), os.environ.get("KALSHI_KEY_PATH")
