@@ -118,6 +118,11 @@ def stamp():
     return datetime.now().strftime("%H:%M:%S")
 
 
+def mins(secs):
+    """Time left as minutes, e.g. 12.5 min."""
+    return f"{max(secs, 0) / 60:.1f} min"
+
+
 def parse_time(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
@@ -384,7 +389,7 @@ def decide(m, spot, sigma, hist, now_t):
     close_t = parse_time(m["close_time"]).timestamp()
     secs = close_t - now_t
     if not (MIN_SECS <= secs <= MAX_SECS):
-        return None, f"outside trading window ({secs:.0f}s left)", None
+        return None, f"outside trading window ({mins(secs)} left)", None
     p_model = prob_up(spot, strike, hist, now_t, close_t, sigma)
     if p_model is None:
         return None, "not enough recorded prices yet", None
@@ -395,7 +400,7 @@ def decide(m, spot, sigma, hist, now_t):
     p = (1 - MARKET_WEIGHT) * p_model + MARKET_WEIGHT * mid
     snap = {"secs_left": round(secs), "spot": spot, "strike": strike, "p_model": round(p_model, 4),
             "p_blend": round(p, 4), "mid": mid, "sigma": round(sigma, 3)}
-    info = f"{lean_tag(p)[0]} | {secs:.0f}s model={p_model:.0%} mid={mid:.0%} blend={p:.0%} gap=${spot - strike:+,.0f}"
+    info = f"{lean_tag(p)[0]} | {mins(secs)} model={p_model:.0%} mid={mid:.0%} blend={p:.0%} gap=${spot - strike:+,.0f}"
     if ya - yb > MAX_SPREAD:
         return None, info + f" | spread {ya - yb:.2f} too wide", snap
     opts = []
@@ -794,13 +799,13 @@ class Bot:
                 self.lean[tk] = (side_now, n)
                 print(f"[{stamp()}] \U0001F504 FLIP {tk}: now {lean_tag(snap['p_blend'])[0]} | flipped {n}x this window")
                 notify(f"\U0001F504 Kalshi {LABEL} FLIP", f"{lean_tag(snap['p_blend'])[0]}\n"
-                       f"Flipped {n}x this window. {snap['secs_left']}s left, spot ${spot:,.2f} vs strike ${snap['strike']:,.2f}.")
+                       f"Flipped {n}x this window. {mins(snap['secs_left'])} left, spot ${spot:,.2f} vs strike ${snap['strike']:,.2f}.")
             elif not prev:
                 self.lean[tk] = (side_now, 0)
             if tk in self.coinflip and conf_now >= 0.75:
                 self.coinflip.discard(tk)
                 notify(f"\u2705 Kalshi {LABEL}: RISK DROPPED", f"{lean_tag(snap['p_blend'])[0]}\n"
-                       f"{snap['secs_left']}s left. This was a coin flip earlier; it is a firmer call now.")
+                       f"{mins(snap['secs_left'])} left. This was a coin flip earlier; it is a firmer call now.")
             if tk not in self.called:               # one call per window, as soon as it is inside the trading window
                 self.called.add(tk)
                 self.ledger.add_call(tk, side_now, conf_now)
@@ -811,7 +816,7 @@ class Bot:
                 if tk not in self.surged and tk not in self.last_scalp and conf_now >= 0.90:
                     self.surged[tk] = (side_now, None, snap["mid"])
                 notify(f"Kalshi {LABEL} CALL", f"{lean_tag(snap['p_blend'])[0]}\n"
-                       f"{snap['secs_left']}s left | spot ${spot:,.2f} vs strike ${snap['strike']:,.2f} "
+                       f"{mins(snap['secs_left'])} left | spot ${spot:,.2f} vs strike ${snap['strike']:,.2f} "
                        f"({spot - snap['strike']:+,.0f})\nKalshi: YES ask {ya * 100:.0f}c / NO ask {na * 100:.0f}c\n"
                        + ("\u23F8\uFE0F SIT OUT: this is a coin flip. Wait, risk drops later in the window; "
                           "you will get a RISK DROPPED alert if it firms up.\n" if flip else "")
@@ -850,7 +855,7 @@ class Bot:
         hit, n = self.ledger.open_stats()
         rec_txt = f"Opening-call record: {hit}/{n} ({hit / n:.0%})" if n else "Opening-call record: no results yet"
         notify(f"\u26A1 {LABEL} OPENING CALL",
-               f"{txt}\n{secs:.0f}s left | spot ${spot:,.2f} vs strike ${strike:,.2f} ({spot - strike:+,.0f})\n"
+               f"{txt}\n{mins(secs)} left | spot ${spot:,.2f} vs strike ${strike:,.2f} ({spot - strike:+,.0f})\n"
                f"Early read with ~15 min to go: far less certain than the late call, "
                f"price can still swing either way. {rec_txt}.")
         print(f"[{stamp()}] OPENING CALL {tk}: {txt}")
@@ -873,13 +878,13 @@ class Bot:
         if first is not None and abs(mid - first) >= SURGE_MOVE:
             self.surged[tk] = (side, first, mid)
             notify(f"\U0001F680 {LABEL} SURGE {side}",
-                   f"Unexpected sudden move: market went {first:.0%} -> {mid:.0%} on UP with {secs:.0f}s left.\n"
+                   f"Unexpected sudden move: market went {first:.0%} -> {mid:.0%} on UP with {mins(secs)} left.\n"
                    f"The price jumped too fast to enter safely, so NO early calls this round. "
                    f"The bot will send its normal call in the last 4 minutes.")
         elif first is None and (mid >= 0.85 or mid <= 0.15):
             self.surged[tk] = (side, None, mid)
             notify(f"\U0001F680 {LABEL} ONE-SIDED MARKET",
-                   f"Market is already {mid:.0%} on UP with {secs:.0f}s left. No safe entry, so NO early calls. "
+                   f"Market is already {mid:.0%} on UP with {mins(secs)} left. No safe entry, so NO early calls. "
                    f"The bot will send its normal call in the last 4 minutes.")
         else:
             return
@@ -939,7 +944,7 @@ class Bot:
             else:
                 txt = (f"Price is moving steadily {new[1]}. Hold with the trend, take profit on target, and do NOT "
                        f"buy the cheap side against it.")
-            notify(f"{self.regime_label()}", f"{txt}\n{secs:.0f}s left.")
+            notify(f"{self.regime_label()}", f"{txt}\n{mins(secs)} left.")
             print(f"[{stamp()}] REGIME {new[0]} {new[1] or ''} {tk}")
 
     def scalp_check(self, m, spot, sigma, now_t):
@@ -956,7 +961,7 @@ class Bot:
             flips += 1
             self.scalp_lean[tk] = (lean_side, flips)
             if s["secs"] > MAX_SECS:       # inside the last 4 minutes the main FLIP alert handles it
-                notify(f"\U0001F504 {LABEL} FLIP", f"{lean_txt}\nFlipped {flips}x this window. {s['secs']:.0f}s left.")
+                notify(f"\U0001F504 {LABEL} FLIP", f"{lean_txt}\nFlipped {flips}x this window. {mins(s['secs'])} left.")
         elif not prev:
             self.scalp_lean[tk] = (lean_side, 0)
         rname, rdir = self.cur_regime[0], self.cur_regime[1]
@@ -965,7 +970,7 @@ class Bot:
         body = (f"{dot} {s['name']} @ {s['cost'] * 100:.0f}c | win chance {s['p_side']:.0%} | "
                 f"edge {s['edge']:+.2f}\nLean: {lean_txt} | flipped {flips}x\n"
                 f"Flip risk: {1 - lean_conf:.0%}\nMarket: {self.regime_label()}\n"
-                f"{s['secs']:.0f}s left | spot ${spot:,.2f} vs strike ${float(m['floor_strike']):,.2f}")
+                f"{mins(s['secs'])} left | spot ${spot:,.2f} vs strike ${float(m['floor_strike']):,.2f}")
         if enter and now_t - self.last_scalp.get(tk, 0) >= SCALP_COOLDOWN:
             self.last_scalp[tk] = now_t
             self.scalp_pos.setdefault(tk, {"name": s["name"], "cost": s["cost"], "target": s["target"]})
@@ -1011,7 +1016,7 @@ class Bot:
             rec_txt = self.ledger.record_scalp(tk, True, "take_profit")
             notify(f"\U0001F4B0 {LABEL} TAKE PROFIT: sell {name} now",
                    f"Exit ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c per contract).\n{adv}\n"
-                   f"{secs:.0f}s left. Scalps: {rec_txt}. Alert only.")
+                   f"{mins(secs)} left. Scalps: {rec_txt}. Alert only.")
             print(f"[{stamp()}] TAKE PROFIT {name} {tk} exit={exit_bid:.2f} entry={cost:.2f}")
             self.scalp_pos.pop(tk, None)
             return
@@ -1026,7 +1031,7 @@ class Bot:
         if secs <= END_WARN_SECS and tk not in self.end_sent:
             self.end_sent.add(tk)
             notify(f"\u23F1\uFE0F {LABEL} ENDING SOON: {name} still open",
-                   f"{secs:.0f}s left. Sell now at ~{exit_bid * 100:.0f}c, or hold to settlement "
+                   f"{mins(secs)} left. Sell now at ~{exit_bid * 100:.0f}c, or hold to settlement "
                    f"(pays 100c if {name} wins, 0 if not).")
             return
         if now_t - self.last_hold.get(tk, 0) >= HOLD_SECS:
@@ -1041,7 +1046,7 @@ class Bot:
                 why = "No clear trend yet. Hold for the target."
             notify(f"\u270B {LABEL} HOLD {name}",
                    f"Now ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c). "
-                   f"Target {target * 100:.0f}c.\n{why}\n{secs:.0f}s left.")
+                   f"Target {target * 100:.0f}c.\n{why}\n{mins(secs)} left.")
 
     def sit_out(self, m, reason):
         """Tell the group once per window that no call is coming yet, and why."""
@@ -1052,7 +1057,7 @@ class Bot:
             return
         self.sat_out.add(tk)
         notify(f"\u23F8\uFE0F Kalshi {LABEL}: SITTING OUT (for now)",
-               f"No call yet, {secs:.0f}s left. Reason: {reason}.\n"
+               f"No call yet, {mins(secs)} left. Reason: {reason}.\n"
                f"Wait: a call will be sent if the data clears before the window ends.")
 
     def stats_line(self):
