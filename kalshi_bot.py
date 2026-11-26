@@ -99,6 +99,16 @@ SCALP_COOLDOWN = 20      # seconds between ENTER alerts per window
 SCALP_TARGET = 0.10      # take-profit: exit when price is 10c above entry
 PULSE_SECS = 30          # status update interval when there's no entry
 SURGE_MOVE = 0.35        # market price jump (35 points) from early in the window = "unexpected surge"
+SCALP_STOP = 0.10        # CUT alert if the exit price falls this far below entry
+HOLD_SECS = 45           # how often to send HOLD updates while a scalp is open
+END_WARN_SECS = 45       # warn this many secs before the window ends if a scalp is still open
+# market regime (choppy vs steady one-sided), measured on the Kalshi price
+REGIME_WINDOW = 120      # look at the last 2 minutes
+REGIME_STEP = 5          # sample the price every 5s
+CHOP_MIN_PATH = 0.15     # price must have travelled at least 15 points...
+CHOP_MAX_ER = 0.35       # ...while making little net progress = CHOPPY
+TREND_MIN_NET = 0.10     # net move of at least 10 points...
+TREND_MIN_ER = 0.55      # ...mostly in one direction = STEADY ONE-SIDED
 OPEN_CALL_WINDOW = 45     # send the opening call within the first 45s of a window
 WINDOW_SECS = 900         # length of a window (15 minutes)
 SURGE_START_SECS = 600   # only measure the surge against prices seen with more than this many secs left
@@ -606,6 +616,9 @@ class Bot:
         self.lean = {}                           # ticker -> (current side, flip count)
         self.last_scalp, self.last_pulse = {}, {}  # scalp signal timers per ticker
         self.opened = set()
+        self.mids, self.cur_regime, self.last_regime_alert = deque(maxlen=600), ("WARMING", None), 0.0
+        self.scalp_pos, self.rotate_from, self.last_hold = {}, {}, {}
+        self.tp_sent, self.end_sent = set(), set()
         self.first_mid, self.surged = {}, {}       # surge detection per ticker
         self.scalp_lean = {}                       # ticker -> (side, flip count) for scalp messages
         self.last_log, self.last_hb = 0.0, time.time()
@@ -712,7 +725,9 @@ class Bot:
         self.reason[tk] = info
         self.open_call(m, spot, sigma, now_t)       # quick opening call (first ~45s of a window)
         self.surge_check(m)                         # detect unexpected surges (explains late calls)
+        self.update_regime(m, now_t)                # choppy vs steady one-sided
         self.scalp_check(m, spot, sigma, now_t)     # low-% side scalp signals (alert only)
+        self.manage_position(m, now_t)              # take-profit / hold / cut / rotate alerts
         if not snap:
             self.sit_out(m, info)
         if snap:
@@ -826,6 +841,51 @@ class Bot:
         return (f"\U0001F680 WHY NO EARLIER CALLS: {why}. "
                 f"There was no safe entry, so the bot sat out the round and is calling it now.\n")
 
+    def regime_label(self):
+        name, d = self.cur_regime[0], self.cur_regime[1]
+        if name == "CHOPPY":
+            return "\U0001F500 CHOPPY (swinging up and down)"
+        if name == "TRENDING":
+            return f"\u27A1\uFE0F STEADY ONE-SIDED {d}"
+        return "\u23F3 MIXED / unclear" if name == "MIXED" else "\u23F3 measuring..."
+
+    def update_regime(self, m, now_t):
+        """Classify the market as CHOPPY or TRENDING from how the Kalshi price has moved."""
+        tk = m["ticker"]
+        ya, yb = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars")
+        if not (0 < yb <= ya < 1):
+            return
+        mid = (ya + yb) / 2
+        if not self.mids or now_t - self.mids[-1][0] >= REGIME_STEP:
+            self.mids.append((now_t, tk, mid))
+        pts = [x[2] for x in self.mids if x[1] == tk and x[0] >= now_t - REGIME_WINDOW]
+        if len(pts) < 8:
+            self.cur_regime = ("WARMING", None, 0.0, 0.0)
+            return
+        path = sum(abs(b2 - a2) for a2, b2 in zip(pts, pts[1:]))
+        net = pts[-1] - pts[0]
+        er = abs(net) / path if path > 0 else 0.0
+        if abs(net) >= TREND_MIN_NET and er >= TREND_MIN_ER:
+            new = ("TRENDING", "UP" if net > 0 else "DOWN", net, er)
+        elif path >= CHOP_MIN_PATH and er <= CHOP_MAX_ER:
+            new = ("CHOPPY", None, net, er)
+        else:
+            new = ("MIXED", None, net, er)
+        old = self.cur_regime
+        self.cur_regime = new
+        changed = (old[0], old[1]) != (new[0], new[1])
+        if changed and new[0] in ("CHOPPY", "TRENDING") and now_t - self.last_regime_alert >= 60:
+            self.last_regime_alert = now_t
+            secs = parse_time(m["close_time"]).timestamp() - now_t
+            if new[0] == "CHOPPY":
+                txt = ("Price is swinging up and down with no clear direction. Scalping the cheap side is more "
+                       "workable here: take profits quickly and watch for rotation alerts.")
+            else:
+                txt = (f"Price is moving steadily {new[1]}. Hold with the trend, take profit on target, and do NOT "
+                       f"buy the cheap side against it.")
+            notify(f"{self.regime_label()}", f"{txt}\n{secs:.0f}s left.")
+            print(f"[{stamp()}] REGIME {new[0]} {new[1] or ''} {tk}")
+
     def scalp_check(self, m, spot, sigma, now_t):
         """Send repeated ENTER alerts for the low-% side, plus a regular pulse. Alert only."""
         tk = m["ticker"]
@@ -843,18 +903,87 @@ class Bot:
                 notify(f"\U0001F504 {LABEL} FLIP", f"{lean_txt}\nFlipped {flips}x this window. {s['secs']:.0f}s left.")
         elif not prev:
             self.scalp_lean[tk] = (lean_side, 0)
+        rname, rdir = self.cur_regime[0], self.cur_regime[1]
+        against = rname == "TRENDING" and rdir != s["name"]    # cheap side is against a steady trend
+        enter = s["enter"] and not against
         body = (f"{dot} {s['name']} @ {s['cost'] * 100:.0f}c | win chance {s['p_side']:.0%} | "
                 f"edge {s['edge']:+.2f}\nLean: {lean_txt} | flipped {flips}x\n"
-                f"Flip risk: {1 - lean_conf:.0%}\n"
+                f"Flip risk: {1 - lean_conf:.0%}\nMarket: {self.regime_label()}\n"
                 f"{s['secs']:.0f}s left | spot ${spot:,.2f} vs strike ${float(m['floor_strike']):,.2f}")
-        if s["enter"] and now_t - self.last_scalp.get(tk, 0) >= SCALP_COOLDOWN:
+        if enter and now_t - self.last_scalp.get(tk, 0) >= SCALP_COOLDOWN:
             self.last_scalp[tk] = now_t
+            self.scalp_pos.setdefault(tk, {"name": s["name"], "cost": s["cost"], "target": s["target"]})
+            rot = self.rotate_from.pop(tk, None)
+            title = (f"\U0001F501 {LABEL} ROTATE: ENTER {s['name']} (other side)" if rot and rot != s["name"]
+                     else f"\u26A1 {LABEL} SCALP: ENTER LOW SIDE")
             print(f"[{stamp()}] SCALP ENTER {body}")
-            notify(f"\u26A1 {LABEL} SCALP: ENTER LOW SIDE",
-                   body + f"\nTarget exit: {s['target'] * 100:.0f}c. Alert only.")
+            notify(title, body + f"\nTarget exit: {s['target'] * 100:.0f}c. Alert only.")
         elif now_t - self.last_pulse.get(tk, 0) >= PULSE_SECS:
             self.last_pulse[tk] = now_t
-            notify(f"{LABEL} pulse", body + ("\nNo entry yet." if not s["enter"] else ""))
+            extra = ""
+            if s["enter"] and against:
+                extra = f"\nSteady {rdir} trend: this cheap side is against it, so no entry."
+            elif not s["enter"]:
+                extra = "\nNo entry yet."
+            notify(f"{LABEL} pulse", body + extra)
+
+    def manage_position(self, m, now_t):
+        """Track the open scalp (from the first ENTER alert) and say when to take profit, hold, cut or rotate."""
+        tk = m["ticker"]
+        pos = self.scalp_pos.get(tk)
+        if not pos:
+            return
+        ya, yb = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars")
+        if not (0 < yb <= ya < 1):
+            return
+        name, cost, target = pos["name"], pos["cost"], pos["target"]
+        exit_bid = yb if name == "UP" else (num(m, "no_bid_dollars") or (1 - ya))
+        other = "DOWN" if name == "UP" else "UP"
+        other_cost = num(m, "no_ask_dollars") if name == "UP" else ya
+        pnl = exit_bid - cost
+        secs = parse_time(m["close_time"]).timestamp() - now_t
+        rname, rdir = self.cur_regime[0], self.cur_regime[1]
+        if exit_bid >= target:
+            if rname == "CHOPPY":
+                adv = (f"Choppy market: the {other} side is now {other_cost * 100:.0f}c. Watch for a ROTATE alert "
+                       f"to scalp it back the other way.")
+                self.rotate_from[tk] = name
+            elif rname == "TRENDING" and rdir == name:
+                adv = f"Steady {name} trend, so it could run further, but profit is in hand. Take it, or hold with care."
+            else:
+                adv = "Take it. Don't chase more."
+            notify(f"\U0001F4B0 {LABEL} TAKE PROFIT: sell {name} now",
+                   f"Exit ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c per contract).\n{adv}\n"
+                   f"{secs:.0f}s left. Alert only.")
+            print(f"[{stamp()}] TAKE PROFIT {name} {tk} exit={exit_bid:.2f} entry={cost:.2f}")
+            self.scalp_pos.pop(tk, None)
+            return
+        if pnl <= -SCALP_STOP:
+            notify(f"\U0001F6D1 {LABEL} CUT: {name} is going against you",
+                   f"Exit ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c per contract).\n"
+                   f"Market: {self.regime_label()}. Consider cutting the loss. Alert only.")
+            print(f"[{stamp()}] CUT {name} {tk} exit={exit_bid:.2f} entry={cost:.2f}")
+            self.scalp_pos.pop(tk, None)
+            return
+        if secs <= END_WARN_SECS and tk not in self.end_sent:
+            self.end_sent.add(tk)
+            notify(f"\u23F1\uFE0F {LABEL} ENDING SOON: {name} still open",
+                   f"{secs:.0f}s left. Sell now at ~{exit_bid * 100:.0f}c, or hold to settlement "
+                   f"(pays 100c if {name} wins, 0 if not).")
+            return
+        if now_t - self.last_hold.get(tk, 0) >= HOLD_SECS:
+            self.last_hold[tk] = now_t
+            if rname == "TRENDING" and rdir == name:
+                why = f"Steady {name} trend is with you. Hold toward the target."
+            elif rname == "TRENDING":
+                why = f"Steady {rdir} trend is AGAINST you. Don't add; consider cutting if it keeps falling."
+            elif rname == "CHOPPY":
+                why = "Choppy market: expect swings. Hold for the target, don't panic on small dips."
+            else:
+                why = "No clear trend yet. Hold for the target."
+            notify(f"\u270B {LABEL} HOLD {name}",
+                   f"Now ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c). "
+                   f"Target {target * 100:.0f}c.\n{why}\n{secs:.0f}s left.")
 
     def sit_out(self, m, reason):
         """Tell the group once per window that no call is coming yet, and why."""
