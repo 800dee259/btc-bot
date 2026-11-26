@@ -99,6 +99,8 @@ SCALP_COOLDOWN = 20      # seconds between ENTER alerts per window
 SCALP_TARGET = 0.10      # take-profit: exit when price is 10c above entry
 PULSE_SECS = 30          # status update interval when there's no entry
 SURGE_MOVE = 0.35        # market price jump (35 points) from early in the window = "unexpected surge"
+OPEN_CALL_WINDOW = 45     # send the opening call within the first 45s of a window
+WINDOW_SECS = 900         # length of a window (15 minutes)
 SURGE_START_SECS = 600   # only measure the surge against prices seen with more than this many secs left
 
 
@@ -436,7 +438,8 @@ def scalp_signal(m, spot, sigma, hist, now_t):
 class Ledger:
     def __init__(self, api):
         self.api, self.lock = api, threading.Lock()
-        self.snaps, self.trades = {}, {}
+        self.snaps, self.trades, self.opens = {}, {}, {}
+        self.open_n, self.open_hit = 0, 0
         self.pnl, self.bm, self.bk, self.nb = [], 0.0, 0.0, 0
         try:
             with open(CALIB_LOG) as f:
@@ -444,6 +447,9 @@ class Ledger:
                     r = json.loads(line)
                     if r.get("pnl") is not None:
                         self.pnl.append(r["pnl"])
+                    if r.get("open_hit") is not None:
+                        self.open_n += 1
+                        self.open_hit += int(r["open_hit"])
                     if "p_model" in r and r.get("y") is not None:
                         self._brier(r["p_model"], r["mid"], r["y"])
         except Exception:
@@ -457,6 +463,13 @@ class Ledger:
     def record_snap(self, tk, snap):
         if snap["secs_left"] <= 120 and tk not in self.snaps:
             self.snaps[tk] = snap               # one comparable forecast per window, ~2 min out
+
+    def add_open(self, tk, side, conf):
+        self.opens[tk] = {"side": side, "conf": round(conf, 4)}
+
+    def open_stats(self):
+        with self.lock:
+            return self.open_hit, self.open_n
 
     def add_trade(self, tk, a):
         self.trades[tk] = dict(a)
@@ -481,11 +494,11 @@ class Ledger:
         return True, f"avg {mean * 100:+.1f}c/contract over {n} trades"
 
     def finish(self, tk):
-        snap, trade = self.snaps.pop(tk, None), self.trades.pop(tk, None)
-        if snap or trade:
-            threading.Thread(target=self._settle, args=(tk, snap, trade), daemon=True).start()
+        snap, trade, opn = self.snaps.pop(tk, None), self.trades.pop(tk, None), self.opens.pop(tk, None)
+        if snap or trade or opn:
+            threading.Thread(target=self._settle, args=(tk, snap, trade, opn), daemon=True).start()
 
-    def _settle(self, tk, snap, trade):
+    def _settle(self, tk, snap, trade, opn=None):
         result = None
         for _ in range(20):
             time.sleep(15)
@@ -509,7 +522,21 @@ class Ledger:
             rec["trade"], rec["pnl"] = trade, round(pnl, 4)
             with self.lock:
                 self.pnl.append(pnl)
+        open_msg = None
+        if opn:
+            hit = (opn["side"] == "UP") == (y == 1.0)
+            rec["open_call"], rec["open_hit"] = opn, int(hit)
+            with self.lock:
+                self.open_n += 1
+                self.open_hit += int(hit)
+                oh, on = self.open_hit, self.open_n
+            open_msg = (f"{opn['side']} call at {opn['conf']:.0%} confidence {'HIT' if hit else 'MISSED'}. "
+                        f"Ended {result.upper()}. Opening-call record: {oh}/{on} ({oh / on:.0%})")
         log_line(CALIB_LOG, rec)
+        if open_msg:
+            print(f"[{stamp()}] opening call: {open_msg}")
+            mark = "\u2705" if hit else "\u274C"
+            notify(f"{mark} {LABEL} opening call result", open_msg)
         n, mean, se, bm, bk = self.stats()
         msg = f"settled {tk}: {result.upper()}"
         if trade:
@@ -578,6 +605,7 @@ class Bot:
         self._err_alert = 0.0
         self.lean = {}                           # ticker -> (current side, flip count)
         self.last_scalp, self.last_pulse = {}, {}  # scalp signal timers per ticker
+        self.opened = set()
         self.first_mid, self.surged = {}, {}       # surge detection per ticker
         self.scalp_lean = {}                       # ticker -> (side, flip count) for scalp messages
         self.last_log, self.last_hb = 0.0, time.time()
@@ -682,6 +710,7 @@ class Bot:
         tk = m["ticker"]
         action, info, snap = decide(m, spot, sigma, list(self.hist), now_t)
         self.reason[tk] = info
+        self.open_call(m, spot, sigma, now_t)       # quick opening call (first ~45s of a window)
         self.surge_check(m)                         # detect unexpected surges (explains late calls)
         self.scalp_check(m, spot, sigma, now_t)     # low-% side scalp signals (alert only)
         if not snap:
@@ -726,6 +755,34 @@ class Bot:
         if will_act:
             self.act(tk, action, tries)
         return False
+
+    def open_call(self, m, spot, sigma, now_t):
+        """One quick call in the first seconds of a window: where will price settle vs the strike?"""
+        tk = m["ticker"]
+        if tk in self.opened or m.get("floor_strike") is None:
+            return
+        close_t = parse_time(m["close_time"]).timestamp()
+        secs = close_t - now_t
+        if not (WINDOW_SECS - OPEN_CALL_WINDOW <= secs <= WINDOW_SECS):
+            return
+        ya, yb = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars")
+        if not (0 < yb <= ya < 1):
+            return
+        strike = float(m["floor_strike"])
+        pm = prob_up(spot, strike, list(self.hist), now_t, close_t, sigma)
+        if pm is None:
+            return
+        p = (1 - MARKET_WEIGHT) * pm + MARKET_WEIGHT * (ya + yb) / 2
+        txt, side, conf = lean_tag(p)
+        self.opened.add(tk)
+        self.ledger.add_open(tk, side, conf)
+        hit, n = self.ledger.open_stats()
+        rec_txt = f"Opening-call record: {hit}/{n} ({hit / n:.0%})" if n else "Opening-call record: no results yet"
+        notify(f"\u26A1 {LABEL} OPENING CALL",
+               f"{txt}\n{secs:.0f}s left | spot ${spot:,.2f} vs strike ${strike:,.2f} ({spot - strike:+,.0f})\n"
+               f"Early read with ~15 min to go: far less certain than the late call, "
+               f"price can still swing either way. {rec_txt}.")
+        print(f"[{stamp()}] OPENING CALL {tk}: {txt}")
 
     def surge_check(self, m):
         """Flag a sudden one-sided move so the group knows why there were no early calls."""
@@ -883,6 +940,8 @@ def main():
         ok, why = Ledger(None).gate()
         print(f"tracked trades: {n} | avg {mean * 100:+.2f}c/contract after fees (+/-{se * 100:.2f}c)")
         print(f"Brier: model {bm if bm is None else round(bm, 4)} vs market {bk if bk is None else round(bk, 4)}")
+        oh, on = Ledger(None).open_stats()
+        print(f"opening calls: {oh}/{on} correct")
         print(f"live gate: {'OPEN' if ok else 'CLOSED'} ({why})")
         return
     key_id, key_path = os.environ.get("KALSHI_KEY_ID"), os.environ.get("KALSHI_KEY_PATH")
