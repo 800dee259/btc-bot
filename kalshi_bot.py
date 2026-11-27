@@ -381,6 +381,29 @@ def lean_tag(p_up):
     return f"{dot} {side} {conf:.0%} ({label}, {1 - conf:.0%} risk)", side, conf
 
 
+def pressure_score(hist, strike, mid_move, sigma, now_t):
+    """-100..+100: which side is pushing harder right now. Positive = UP.
+    Blends BTC momentum (30s and 2 min), time spent above/below the strike, and the Kalshi price move."""
+    if not hist or not sigma:
+        return None
+    clip = lambda x: max(-1.0, min(1.0, x))
+
+    def spot_ago(age):
+        for t, p in hist:
+            if t >= now_t - age:
+                return p
+        return None
+
+    cur = hist[-1][1]
+    s30, s120 = spot_ago(30), spot_ago(120)
+    z30 = clip((cur - s30) / (sigma * math.sqrt(30)) / 2) if s30 else 0.0
+    z120 = clip((cur - s120) / (sigma * math.sqrt(120)) / 2) if s120 else 0.0
+    win = [p for t, p in hist if t >= now_t - 120]
+    share = (sum(1 for p in win if p > strike) / len(win) - 0.5) * 2 if win else 0.0
+    kd = clip(mid_move / 0.10)
+    return round(100 * (0.35 * z30 + 0.20 * z120 + 0.25 * share + 0.20 * kd))
+
+
 def num(m, key):
     try:
         return float(m.get(key) or 0)
@@ -686,6 +709,7 @@ class Bot:
         self.mids, self.cur_regime, self.last_regime_alert = deque(maxlen=600), ("WARMING", None), 0.0
         self.scalp_pos, self.rotate_from, self.last_hold = {}, {}, {}
         self.tp_sent, self.end_sent, self.warn_sent = set(), set(), set()
+        self.cur_press, self.press_hist, self.last_shift = None, deque(maxlen=200), {}
         self.first_mid, self.surged = {}, {}       # surge detection per ticker
         self.scalp_lean = {}                       # ticker -> (side, flip count) for scalp messages
         self.last_log, self.last_hb = 0.0, time.time()
@@ -794,6 +818,7 @@ class Bot:
         self.open_call(m, spot, sigma, now_t)       # quick opening call (first ~45s of a window)
         self.surge_check(m)                         # detect unexpected surges (explains late calls)
         self.update_regime(m, now_t)                # choppy vs steady one-sided
+        self.update_pressure(m, spot, sigma, now_t) # which side is pushing harder
         self.scalp_check(m, spot, sigma, now_t)     # low-% side scalp signals (alert only)
         self.manage_position(m, now_t)              # take-profit / hold / cut / rotate alerts
         if not snap:
@@ -823,7 +848,11 @@ class Bot:
                 ya, na = num(m, "yes_ask_dollars"), num(m, "no_ask_dollars")
                 if tk not in self.surged and tk not in self.last_scalp and conf_now >= 0.90:
                     self.surged[tk] = (side_now, None, snap["mid"])
+                flips_n = max(self.lean.get(tk, (None, 0))[1], self.scalp_lean.get(tk, (None, 0))[1])
                 notify(f"Kalshi {LABEL} CALL", f"{lean_tag(snap['p_blend'])[0]}\n"
+                       f"Flip risk: {1 - conf_now:.0%} | flipped {flips_n}x\n"
+                       f"Market: {self.regime_label()}\n"
+                       f"\u2694\uFE0F Pressure: {self.press_line()}\n"
                        f"{mins(snap['secs_left'])} left | spot ${spot:,.2f} vs strike ${snap['strike']:,.2f} "
                        f"({spot - snap['strike']:+,.0f})\nKalshi: YES ask {ya * 100:.0f}c / NO ask {na * 100:.0f}c\n"
                        + ("\u23F8\uFE0F SIT OUT: this is a coin flip. Wait, risk drops later in the window; "
@@ -919,6 +948,46 @@ class Bot:
         if name == "DECIDED":
             return f"\U0001F512 DECIDED {d} (round is basically over, no scalps)"
         return "\u23F3 MIXED / unclear" if name == "MIXED" else "\u23F3 measuring..."
+
+    def press_line(self):
+        sc = self.cur_press
+        if sc is None:
+            return "measuring..."
+        up = (sc + 100) // 2
+        filled = round(up / 10)
+        bar = "\U0001F7E2" * filled + "\U0001F534" * (10 - filled)
+        if abs(sc) < 15:
+            tag = "even fight"
+        else:
+            side = "UP" if sc > 0 else "DOWN"
+            tag = f"{side} pushing harder" if abs(sc) >= 40 else f"{side} edging ahead"
+        return f"{bar} UP {up}% / DOWN {100 - up}% ({tag})"
+
+    def update_pressure(self, m, spot, sigma, now_t):
+        tk, strike = m["ticker"], m.get("floor_strike")
+        if strike is None or sigma is None:
+            return
+        ya, yb = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars")
+        mid_move = 0.0
+        if 0 < yb <= ya < 1:
+            past = [mid for t, k, mid in self.mids if k == tk and 25 <= now_t - t <= 45]
+            if past:
+                mid_move = (ya + yb) / 2 - past[-1]
+        score = pressure_score(list(self.hist), float(strike), mid_move, sigma, now_t)
+        if score is None:
+            return
+        self.cur_press = score
+        if not self.press_hist or now_t - self.press_hist[-1][0] >= 5:
+            self.press_hist.append((now_t, tk, score))
+        old = [sc for t, k, sc in self.press_hist if k == tk and 20 <= now_t - t <= 90]
+        flipped = any((o > 0) != (score > 0) and abs(o) >= 20 for o in old)
+        if flipped and abs(score) >= 30 and now_t - self.last_shift.get(tk, 0) >= 60:
+            self.last_shift[tk] = now_t
+            side = "UP" if score > 0 else "DOWN"
+            secs = parse_time(m["close_time"]).timestamp() - now_t
+            notify(f"\u2694\uFE0F {LABEL} MOMENTUM SHIFT: {side} now pushing harder",
+                   f"{self.press_line()}\nThe other side was ahead a minute ago. {mins(secs)} left.")
+            print(f"[{stamp()}] MOMENTUM SHIFT -> {side} {tk} score={score}")
 
     def swing_proof(self, tk, side, now_t):
         """Has THIS side's price actually been swinging, and was it recently at the exit level?
@@ -1016,6 +1085,7 @@ class Bot:
         body = (f"{dot} {s['name']} @ {s['cost'] * 100:.0f}c | win chance {s['p_side']:.0%} | "
                 f"edge {s['edge']:+.2f}\nLean: {lean_txt} | flipped {flips}x\n"
                 f"Flip risk: {1 - lean_conf:.0%}\nMarket: {self.regime_label()}\n"
+                f"\u2694\uFE0F Pressure: {self.press_line()}\n"
                 f"{mins(s['secs'])} left | spot ${spot:,.2f} vs strike ${float(m['floor_strike']):,.2f}")
         if enter and now_t - self.last_scalp.get(tk, 0) >= SCALP_COOLDOWN:
             self.last_scalp[tk] = now_t
@@ -1106,6 +1176,7 @@ class Bot:
             notify(f"\u26A0\uFE0F {LABEL} FLIP WARNING: {name} is falling",
                    f"{name} {how}, now ~{exit_bid * 100:.0f}c (entry {cost * 100:.0f}c, {pnl * 100:+.0f}c). "
                    f"The market may be flipping to {other} ({other_cost * 100:.0f}c).{keep}\n"
+                   f"\u2694\uFE0F Pressure: {self.press_line()}\n"
                    f"Consider exiting now to protect your money. Stop level: {stop_price * 100:.0f}c. "
                    f"{mins(secs)} left. Alert only.")
             print(f"[{stamp()}] FLIP WARNING {name} {tk} exit={exit_bid:.2f} peak={peak:.2f}")
@@ -1119,6 +1190,8 @@ class Bot:
             return
         if now_t - self.last_hold.get(tk, 0) >= HOLD_SECS:
             self.last_hold[tk] = now_t
+            cp = self.cur_press or 0
+            against_txt = "\nPressure is AGAINST your side." if (name == "DOWN" and cp >= 40) or (name == "UP" and cp <= -40) else ""
             if rname == "TRENDING" and rdir == name:
                 why = f"Steady {name} trend is with you. Hold toward the target."
             elif rname == "TRENDING":
@@ -1131,7 +1204,7 @@ class Bot:
             notify(f"\u270B {LABEL} HOLD {name}",
                    f"Now ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c). "
                    f"Target {target * 100:.0f}c | Stop {stop_price * 100:.0f}c.\n"
-                   f"Danger: {danger}\n{why}\n{mins(secs)} left.")
+                   f"Danger: {danger}\n\u2694\uFE0F Pressure: {self.press_line()}{against_txt}\n{why}\n{mins(secs)} left.")
 
     def sit_out(self, m, reason):
         """Tell the group once per window that no call is coming yet, and why."""
