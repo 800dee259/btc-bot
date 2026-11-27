@@ -104,7 +104,10 @@ DECIDED_PRICE = 0.88     # if either side is priced 88%+ the round is decided: n
 SWING_WINDOW = 180       # swing proof: look at the last 3 minutes of this side's price
 SWING_MIN_MOVE = 0.04    # a swing = a move of at least 4 points one way, then back
 SWING_MIN_REVERSALS = 2  # needs at least 2 reversals, and the price must have been at the exit level recently
-SCALP_STOP = 0.10        # CUT alert if the exit price falls this far below entry
+SCALP_STOP = 0.08        # CUT alert if the exit price falls this far below entry
+FLIP_WARN_PEAK_DROP = 0.05  # FLIP WARNING if your side falls 5c from its high since entry...
+FLIP_WARN_FAST_DROP = 0.05  # ...or falls 5c in under 30s (a sudden flip)
+FLIP_FAST_SECS = 30
 HOLD_SECS = 45           # how often to send HOLD updates while a scalp is open
 END_WARN_SECS = 45       # warn this many secs before the window ends if a scalp is still open
 # market regime (choppy vs steady one-sided), measured on the Kalshi price
@@ -682,7 +685,7 @@ class Bot:
         self.opened = set()
         self.mids, self.cur_regime, self.last_regime_alert = deque(maxlen=600), ("WARMING", None), 0.0
         self.scalp_pos, self.rotate_from, self.last_hold = {}, {}, {}
-        self.tp_sent, self.end_sent = set(), set()
+        self.tp_sent, self.end_sent, self.warn_sent = set(), set(), set()
         self.first_mid, self.surged = {}, {}       # surge detection per ticker
         self.scalp_lean = {}                       # ticker -> (side, flip count) for scalp messages
         self.last_log, self.last_hb = 0.0, time.time()
@@ -1057,6 +1060,20 @@ class Bot:
         pnl = exit_bid - cost
         secs = parse_time(m["close_time"]).timestamp() - now_t
         rname, rdir = self.cur_regime[0], self.cur_regime[1]
+        pos["peak"] = peak = max(pos.get("peak", cost), exit_bid, cost)
+        drop_peak = peak - exit_bid
+        side_mid = (ya + yb) / 2 if name == "UP" else 1 - (ya + yb) / 2
+        past = [(mid if name == "UP" else 1 - mid) for t, k, mid in self.mids
+                if k == tk and FLIP_FAST_SECS <= now_t - t <= FLIP_FAST_SECS + 15]
+        fast_drop = (past[-1] - side_mid) if past else 0.0
+        stop_price = max(0.01, cost - SCALP_STOP)
+        flipping = drop_peak >= FLIP_WARN_PEAK_DROP or fast_drop >= FLIP_WARN_FAST_DROP
+        if flipping or pnl <= -0.05:
+            danger = "\U0001F534 HIGH"
+        elif pnl < 0 or drop_peak >= 0.03:
+            danger = "\U0001F7E1 MEDIUM"
+        else:
+            danger = "\U0001F7E2 LOW"
         if exit_bid >= target:
             if rname == "CHOPPY":
                 adv = (f"Choppy market: the {other} side is now {other_cost * 100:.0f}c. Watch for a ROTATE alert "
@@ -1081,6 +1098,19 @@ class Bot:
             print(f"[{stamp()}] CUT {name} {tk} exit={exit_bid:.2f} entry={cost:.2f}")
             self.scalp_pos.pop(tk, None)
             return
+        if flipping and tk not in self.warn_sent:
+            self.warn_sent.add(tk)
+            how = (f"fell {fast_drop * 100:.0f}c in the last {FLIP_FAST_SECS}s" if fast_drop >= FLIP_WARN_FAST_DROP
+                   else f"fell {drop_peak * 100:.0f}c from its high of {peak * 100:.0f}c")
+            keep = " You are still in profit, so consider locking it in." if pnl > 0 else ""
+            notify(f"\u26A0\uFE0F {LABEL} FLIP WARNING: {name} is falling",
+                   f"{name} {how}, now ~{exit_bid * 100:.0f}c (entry {cost * 100:.0f}c, {pnl * 100:+.0f}c). "
+                   f"The market may be flipping to {other} ({other_cost * 100:.0f}c).{keep}\n"
+                   f"Consider exiting now to protect your money. Stop level: {stop_price * 100:.0f}c. "
+                   f"{mins(secs)} left. Alert only.")
+            print(f"[{stamp()}] FLIP WARNING {name} {tk} exit={exit_bid:.2f} peak={peak:.2f}")
+        elif not flipping and tk in self.warn_sent and drop_peak < 0.02:
+            self.warn_sent.discard(tk)            # it recovered: allow a fresh warning later
         if secs <= END_WARN_SECS and tk not in self.end_sent:
             self.end_sent.add(tk)
             notify(f"\u23F1\uFE0F {LABEL} ENDING SOON: {name} still open",
@@ -1094,12 +1124,14 @@ class Bot:
             elif rname == "TRENDING":
                 why = f"Steady {rdir} trend is AGAINST you. Don't add; consider cutting if it keeps falling."
             elif rname == "CHOPPY":
-                why = "Choppy market: expect swings. Hold for the target, don't panic on small dips."
+                why = (f"Choppy market: a dip can bounce back or keep falling. Don't hold past the stop "
+                       f"({stop_price * 100:.0f}c). You'll get a FLIP WARNING if it turns fast.")
             else:
                 why = "No clear trend yet. Hold for the target."
             notify(f"\u270B {LABEL} HOLD {name}",
                    f"Now ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c). "
-                   f"Target {target * 100:.0f}c.\n{why}\n{mins(secs)} left.")
+                   f"Target {target * 100:.0f}c | Stop {stop_price * 100:.0f}c.\n"
+                   f"Danger: {danger}\n{why}\n{mins(secs)} left.")
 
     def sit_out(self, m, reason):
         """Tell the group once per window that no call is coming yet, and why."""
