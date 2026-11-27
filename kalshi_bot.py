@@ -132,6 +132,8 @@ SURGE_START_SECS = 600   # only measure the surge against prices seen with more 
 SNIPE_WATCH, SNIPE_BUILD, SNIPE_STRONG = 35, 55, 75   # score thresholds
 SNIPE_COOLDOWN = 15       # secs between snipe alerts at the same level per window
 SNIPE_REPEAT_SECS = 45    # re-alert at the same level only after this long
+SNIPE_MIN_FLIP_PRICE = 0.10  # no snipe if the side it would flip to is priced under 10% (round is decided)
+SNIPE_MAX_NEED = 1.5      # BTC must be within 1.5 sigma of the strike for the time left (else too far to matter)
 
 
 def stamp():
@@ -440,6 +442,8 @@ def snipe_score(hist, strike, sigma, now_t, secs, mid_move10):
     r5, r15 = abs(move) / 5, abs(p5 - p20) / 15
     accel = clip((r5 / max(r15, sigma * 0.5) - 1) / 3)
     need = abs(gap) / (sigma * math.sqrt(max(secs, 1)))
+    if need > SNIPE_MAX_NEED:                # too far from the strike for the time left: not a real threat
+        return None
     reach = clip(1 - need / 2.5)             # how close the move is to crossing the strike
     kal = clip(mid_move10 / 0.08) if (mid_move10 > 0) == (d == "UP") else 0.0
     score = round(100 * (0.30 * speed + 0.20 * accel + 0.30 * reach + 0.20 * kal))
@@ -1123,6 +1127,12 @@ class Bot:
         r = snipe_score(list(self.hist), float(strike), sigma, now_t, secs, mid_move)
         if not r:
             return
+        if not (0 < yb <= ya < 1):
+            return
+        mid_now = (ya + yb) / 2
+        flip_price = mid_now if r[1] == "UP" else 1 - mid_now     # Kalshi price of the side it would flip to
+        if flip_price < SNIPE_MIN_FLIP_PRICE or self.cur_regime[0] == "DECIDED":
+            return                                               # round is already decided: not a snipe
         self.cur_snipe = r
         sc, d, parts = r
         if sc < SNIPE_WATCH:
