@@ -1082,19 +1082,25 @@ class Bot:
         swing_ok, swing_txt = self.swing_proof(tk, s["name"], now_t)
         fair_ok = s["p_side"] >= s["target"]          # model must value this side at/above the exit price
         enter = (s["enter"] and rname == "CHOPPY" and tk not in self.surged and swing_ok and fair_ok)
-        body = (f"{dot} {s['name']} @ {s['cost'] * 100:.0f}c | win chance {s['p_side']:.0%} | "
-                f"edge {s['edge']:+.2f}\nLean: {lean_txt} | flipped {flips}x\n"
-                f"Flip risk: {1 - lean_conf:.0%}\nMarket: {self.regime_label()}\n"
-                f"\u2694\uFE0F Pressure: {self.press_line()}\n"
-                f"{mins(s['secs'])} left | spot ${spot:,.2f} vs strike ${float(m['floor_strike']):,.2f}")
+        lean_dot = "\U0001F7E2" if lean_side == "UP" else "\U0001F534"
+        common = (f"Flip risk: {1 - lean_conf:.0%} | flipped {flips}x\nMarket: {self.regime_label()}\n"
+                  f"\u2694\uFE0F Pressure: {self.press_line()}\n"
+                  f"{mins(s['secs'])} left | spot ${spot:,.2f} vs strike ${float(m['floor_strike']):,.2f}")
         if enter and now_t - self.last_scalp.get(tk, 0) >= SCALP_COOLDOWN:
             self.last_scalp[tk] = now_t
             self.scalp_pos.setdefault(tk, {"name": s["name"], "cost": s["cost"], "target": s["target"]})
             rot = self.rotate_from.pop(tk, None)
-            title = (f"\U0001F501 {LABEL} ROTATE: ENTER {s['name']} (other side)" if rot and rot != s["name"]
-                     else f"\u26A1 {LABEL} SCALP: ENTER LOW SIDE")
+            cents = f"{s['cost'] * 100:.0f}c"
+            stop_c = max(0.01, s["cost"] - SCALP_STOP) * 100
+            title = (f"\U0001F501 {LABEL} SCALP: BUY {s['name']} @ {cents} (rotate)" if rot and rot != s["name"]
+                     else f"\u26A1 {LABEL} SCALP: BUY {s['name']} @ {cents}")
+            rel = (f"This is AGAINST the main lean ({lean_side}). " if lean_side != s["name"]
+                   else f"This is WITH the main lean ({lean_side}). ")
+            body = (f"{rel}Small size, quick exit, stop at {stop_c:.0f}c.\n"
+                    f"Win chance {s['p_side']:.0%} | edge {s['edge']:+.2f} | exit target {s['target'] * 100:.0f}c\n"
+                    f"Main lean: {lean_txt}\n{common}")
             print(f"[{stamp()}] SCALP ENTER {body}")
-            notify(title, body + f"\nSwing proof: {swing_txt}\nTarget exit: {s['target'] * 100:.0f}c. "
+            notify(title, body + f"\nSwing proof: {swing_txt}\n"
                    f"Evidence of a swing, NOT a guarantee. Alert only.")
         elif now_t - self.last_pulse.get(tk, 0) >= PULSE_SECS:
             self.last_pulse[tk] = now_t
@@ -1112,7 +1118,9 @@ class Bot:
                     extra = "\nMarket isn't clearly choppy, so no entry."
             elif not s["enter"]:
                 extra = "\nNo entry yet."
-            notify(f"{LABEL} pulse", body + extra)
+            # the lean goes first (title + first line) so the phone preview shows the favored side, not the cheap one
+            notify(f"{LABEL} pulse | LEAN {lean_dot} {lean_side} {lean_conf:.0%}",
+                   f"Lean: {lean_txt}\n{common}{extra}")
 
     def manage_position(self, m, now_t):
         """Track the open scalp (from the first ENTER alert) and say when to take profit, hold, cut or rotate."""
@@ -1154,7 +1162,7 @@ class Bot:
             else:
                 adv = "Take it. Don't chase more."
             rec_txt = self.ledger.record_scalp(tk, True, "take_profit")
-            notify(f"\U0001F4B0 {LABEL} TAKE PROFIT: sell {name} now",
+            notify(f"\U0001F4B0 {LABEL} TAKE PROFIT: SELL {name} now",
                    f"Exit ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c per contract).\n{adv}\n"
                    f"{mins(secs)} left. Scalps: {rec_txt}. Alert only.")
             print(f"[{stamp()}] TAKE PROFIT {name} {tk} exit={exit_bid:.2f} entry={cost:.2f}")
@@ -1162,7 +1170,7 @@ class Bot:
             return
         if pnl <= -SCALP_STOP:
             rec_txt = self.ledger.record_scalp(tk, False, "cut")
-            notify(f"\U0001F6D1 {LABEL} CUT: {name} is going against you",
+            notify(f"\U0001F6D1 {LABEL} CUT: SELL {name} (going against you)",
                    f"Exit ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c per contract).\n"
                    f"Market: {self.regime_label()}. Consider cutting the loss. Scalps: {rec_txt}. Alert only.")
             print(f"[{stamp()}] CUT {name} {tk} exit={exit_bid:.2f} entry={cost:.2f}")
