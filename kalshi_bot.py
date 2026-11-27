@@ -90,15 +90,20 @@ HEARTBEAT_SECS = 3600
 CLOSED_STATES = {"closed", "settled", "finalized", "determined", "inactive"}
 
 # ---- scalp signals (low-% side) ----
-SCALP_MIN_PRICE = 0.05   # cheapest side must cost at least this
+SCALP_MIN_PRICE = 0.15   # never scalp a side this cheap or cheaper (no 1c-10c lottery tickets)
 SCALP_MAX_PRICE = 0.35   # ...and at most this (the "low percentage" side)
-SCALP_MIN_SECS = 20      # stop signaling this close to the end
+SCALP_MIN_SECS = 300     # no scalp entries in the last 5 min: too little time for a swing
 SCALP_MAX_SECS = 840     # start signaling about 1 minute into the window
-SCALP_MIN_EDGE = 0.03    # model win chance must beat price + fee by this
+SCALP_MIN_EDGE = 0.05    # model win chance must beat price + fee by this
 SCALP_COOLDOWN = 20      # seconds between ENTER alerts per window
 SCALP_TARGET = 0.10      # take-profit: exit when price is 10c above entry
 PULSE_SECS = 30          # status update interval when there's no entry
 SURGE_MOVE = 0.35        # market price jump (35 points) from early in the window = "unexpected surge"
+SCALP_MAX_SPREAD = 0.03  # bid/ask gap must be tight so you can actually get out
+DECIDED_PRICE = 0.88     # if either side is priced 88%+ the round is decided: no scalps
+SWING_WINDOW = 180       # swing proof: look at the last 3 minutes of this side's price
+SWING_MIN_MOVE = 0.04    # a swing = a move of at least 4 points one way, then back
+SWING_MIN_REVERSALS = 2  # needs at least 2 reversals, and the price must have been at the exit level recently
 SCALP_STOP = 0.10        # CUT alert if the exit price falls this far below entry
 HOLD_SECS = 45           # how often to send HOLD updates while a scalp is open
 END_WARN_SECS = 45       # warn this many secs before the window ends if a scalp is still open
@@ -437,7 +442,7 @@ def scalp_signal(m, spot, sigma, hist, now_t):
     if pm is None:
         return None
     ya, yb, na = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars"), num(m, "no_ask_dollars")
-    if not (0 < yb <= ya < 1) or ya - yb > MAX_SPREAD:
+    if not (0 < yb <= ya < 1) or ya - yb > SCALP_MAX_SPREAD:
         return None
     p = (1 - MARKET_WEIGHT) * pm + MARKET_WEIGHT * (ya + yb) / 2
     name, cost, p_side = ("UP", ya, p) if ya <= na else ("DOWN", na, 1 - p)
@@ -908,7 +913,39 @@ class Bot:
             return "\U0001F500 CHOPPY (swinging up and down)"
         if name == "TRENDING":
             return f"\u27A1\uFE0F STEADY ONE-SIDED {d}"
+        if name == "DECIDED":
+            return f"\U0001F512 DECIDED {d} (round is basically over, no scalps)"
         return "\u23F3 MIXED / unclear" if name == "MIXED" else "\u23F3 measuring..."
+
+    def swing_proof(self, tk, side, now_t):
+        """Has THIS side's price actually been swinging, and was it recently at the exit level?
+        Evidence only: it cannot promise the price will swing back again."""
+        pts = [(t, mid if side == "UP" else 1 - mid) for t, k, mid in self.mids
+               if k == tk and t >= now_t - SWING_WINDOW]
+        if len(pts) < 20:
+            return False, "still measuring"
+        vals = [v for _, v in pts]
+        cur = vals[-1]
+        tp, peak = max(pts, key=lambda x: x[1])
+        swings, d, ext = 0, 0, vals[0]
+        for v in vals[1:]:
+            if d == 0:
+                if v - ext >= SWING_MIN_MOVE:
+                    d, ext = 1, v
+                elif ext - v >= SWING_MIN_MOVE:
+                    d, ext = -1, v
+            elif d == 1:
+                if v > ext:
+                    ext = v
+                elif ext - v >= SWING_MIN_MOVE:
+                    swings, d, ext = swings + 1, -1, v
+            else:
+                if v < ext:
+                    ext = v
+                elif v - ext >= SWING_MIN_MOVE:
+                    swings, d, ext = swings + 1, 1, v
+        txt = f"{swings} swings, was {peak * 100:.0f}c {now_t - tp:.0f}s ago, now {cur * 100:.0f}c"
+        return swings >= SWING_MIN_REVERSALS and peak - cur >= SCALP_TARGET, txt
 
     def update_regime(self, m, now_t):
         """Classify the market as CHOPPY or TRENDING from how the Kalshi price has moved."""
@@ -919,6 +956,9 @@ class Bot:
         mid = (ya + yb) / 2
         if not self.mids or now_t - self.mids[-1][0] >= REGIME_STEP:
             self.mids.append((now_t, tk, mid))
+        if mid >= DECIDED_PRICE or mid <= 1 - DECIDED_PRICE:     # one side priced 88%+: the round is decided
+            self.cur_regime = ("DECIDED", "UP" if mid >= 0.5 else "DOWN", 0.0, 0.0)
+            return
         pts = [x[2] for x in self.mids if x[1] == tk and x[0] >= now_t - REGIME_WINDOW]
         if len(pts) < 8:
             self.cur_regime = ("WARMING", None, 0.0, 0.0)
@@ -935,12 +975,13 @@ class Bot:
         old = self.cur_regime
         self.cur_regime = new
         changed = (old[0], old[1]) != (new[0], new[1])
-        if changed and new[0] in ("CHOPPY", "TRENDING") and now_t - self.last_regime_alert >= 60:
+        secs = parse_time(m["close_time"]).timestamp() - now_t
+        if changed and new[0] in ("CHOPPY", "TRENDING") and secs > SCALP_MIN_SECS \
+                and now_t - self.last_regime_alert >= 60:
             self.last_regime_alert = now_t
-            secs = parse_time(m["close_time"]).timestamp() - now_t
             if new[0] == "CHOPPY":
-                txt = ("Price is swinging up and down with no clear direction. Scalping the cheap side is more "
-                       "workable here: take profits quickly and watch for rotation alerts.")
+                txt = ("Price is swinging up and down with no clear direction. This is NOT an entry signal. "
+                       "Only buy if you get a \u26A1 ENTER alert, which is sent only when price, time and edge all pass.")
             else:
                 txt = (f"Price is moving steadily {new[1]}. Hold with the trend, take profit on target, and do NOT "
                        f"buy the cheap side against it.")
@@ -966,7 +1007,9 @@ class Bot:
             self.scalp_lean[tk] = (lean_side, 0)
         rname, rdir = self.cur_regime[0], self.cur_regime[1]
         against = rname == "TRENDING" and rdir != s["name"]    # cheap side is against a steady trend
-        enter = s["enter"] and not against
+        swing_ok, swing_txt = self.swing_proof(tk, s["name"], now_t)
+        fair_ok = s["p_side"] >= s["target"]          # model must value this side at/above the exit price
+        enter = (s["enter"] and rname == "CHOPPY" and tk not in self.surged and swing_ok and fair_ok)
         body = (f"{dot} {s['name']} @ {s['cost'] * 100:.0f}c | win chance {s['p_side']:.0%} | "
                 f"edge {s['edge']:+.2f}\nLean: {lean_txt} | flipped {flips}x\n"
                 f"Flip risk: {1 - lean_conf:.0%}\nMarket: {self.regime_label()}\n"
@@ -978,12 +1021,22 @@ class Bot:
             title = (f"\U0001F501 {LABEL} ROTATE: ENTER {s['name']} (other side)" if rot and rot != s["name"]
                      else f"\u26A1 {LABEL} SCALP: ENTER LOW SIDE")
             print(f"[{stamp()}] SCALP ENTER {body}")
-            notify(title, body + f"\nTarget exit: {s['target'] * 100:.0f}c. Alert only.")
+            notify(title, body + f"\nSwing proof: {swing_txt}\nTarget exit: {s['target'] * 100:.0f}c. "
+                   f"Evidence of a swing, NOT a guarantee. Alert only.")
         elif now_t - self.last_pulse.get(tk, 0) >= PULSE_SECS:
             self.last_pulse[tk] = now_t
             extra = ""
-            if s["enter"] and against:
-                extra = f"\nSteady {rdir} trend: this cheap side is against it, so no entry."
+            if s["enter"] and not enter:
+                if against:
+                    extra = f"\nSteady {rdir} trend: this cheap side is against it, so no entry."
+                elif tk in self.surged:
+                    extra = "\nSurge this round: no scalp entries."
+                elif not swing_ok:
+                    extra = f"\nNo proven swing yet ({swing_txt}), so no entry."
+                elif not fair_ok:
+                    extra = "\nModel doesn't value this side up at the exit price, so no entry."
+                else:
+                    extra = "\nMarket isn't clearly choppy, so no entry."
             elif not s["enter"]:
                 extra = "\nNo entry yet."
             notify(f"{LABEL} pulse", body + extra)
