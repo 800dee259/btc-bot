@@ -135,6 +135,13 @@ SNIPE_REPEAT_SECS = 45    # re-alert at the same level only after this long
 SNIPE_MIN_FLIP_PRICE = 0.10  # no snipe if the side it would flip to is priced under 10% (round is decided)
 SNIPE_MAX_NEED = 1.5      # BTC must be within 1.5 sigma of the strike for the time left (else too far to matter)
 
+# ---- 50-50 wait ----
+FIFTY_BAND = 0.06         # blended chance within 44%-56% = 50-50: wait, no calls/entries/VALUE picks
+LEAD_EDGE = 0.08          # a lead needs the blend at 58%+ (or 42%-)...
+LEAD_MIN_PRESSURE = 20    # ...with the pressure score agreeing (20+ toward that side)...
+LEAD_CONFIRM_SECS = 8     # ...and BTC model + all of it holding for this many seconds
+WAIT_ALERT_SECS = 20      # send the WAITING alert only if still 50-50 after this long (skips the normal window start)
+
 
 def stamp():
     return datetime.now().strftime("%H:%M:%S")
@@ -764,6 +771,7 @@ class Bot:
         self.tp_sent, self.end_sent, self.warn_sent = set(), set(), set()
         self.cur_press, self.press_hist, self.last_shift = None, deque(maxlen=200), {}
         self.cur_snipe, self.snipe_sent = None, {}   # snipe detector state
+        self.fifty = {}                              # ticker -> 50-50 wait state
         self.cur_verdict, self.last_value = None, {}
         self.first_mid, self.surged = {}, {}       # surge detection per ticker
         self.scalp_lean = {}                       # ticker -> (side, flip count) for scalp messages
@@ -875,6 +883,8 @@ class Bot:
         self.update_regime(m, now_t)                # choppy vs steady one-sided
         self.update_pressure(m, spot, sigma, now_t) # which side is pushing harder
         self.snipe_check(m, spot, sigma, now_t)     # sudden sharp move toward flipping the round
+        self.update_fifty(m, spot, sigma, now_t)    # 50-50: wait until one side takes a confirmed lead
+        waiting = self.is_waiting(tk)
         self.update_verdict(m, spot, sigma, now_t)  # where the BTC model disagrees with Kalshi's price
         self.scalp_check(m, spot, sigma, now_t)     # low-% side scalp signals (alert only)
         self.manage_position(m, now_t)              # take-profit / hold / cut / rotate alerts
@@ -896,7 +906,9 @@ class Bot:
                 self.coinflip.discard(tk)
                 notify(f"\u2705 Kalshi {LABEL}: RISK DROPPED", f"{lean_tag(snap['p_blend'])[0]}\n"
                        f"{mins(snap['secs_left'])} left. This was a coin flip earlier; it is a firmer call now.")
-            if tk not in self.called:               # one call per window, as soon as it is inside the trading window
+            if tk not in self.called and waiting:
+                self.sit_out(m, "it is 50-50 and no side has taken a confirmed lead yet")
+            if tk not in self.called and not waiting:   # one call per window, once a side leads
                 self.called.add(tk)
                 self.ledger.add_call(tk, side_now, conf_now)
                 flip = conf_now < 0.60
@@ -920,7 +932,7 @@ class Bot:
                        + "Alert only, no order placed.")
         tries, next_try = self.attempts.get(tk, (0, 0.0))
         will_act = bool(action) and tk not in self.traded and self.trades_today < MAX_TRADES_PER_DAY \
-            and now_t >= next_try
+            and now_t >= next_try and not waiting
         if will_act or now_t - self.last_log >= 15:
             self.last_log = now_t
             print(f"[{stamp()}] {tk} spot={spot:,.2f} ({note}) strike={m.get('floor_strike')} | {info}")
@@ -1037,7 +1049,7 @@ class Bot:
         best = max(opts, key=lambda o: o[2]) if opts else None
         self.cur_verdict = {"pm": pm, "mid": (ya + yb) / 2, "best": best, "spread": ya - yb, "secs": secs}
         if (best and VERDICT_MIN_EDGE <= best[2] <= MAX_EDGE and ya - yb <= MAX_SPREAD and secs >= VALUE_MIN_SECS
-                and self.cur_regime[0] != "DECIDED"
+                and self.cur_regime[0] != "DECIDED" and not self.is_waiting(tk)
                 and now_t - self.last_value.get((tk, best[0]), 0) >= VALUE_COOLDOWN):
             self.last_value[(tk, best[0])] = now_t
             notify(f"\U0001F3AF {LABEL} VALUE: {best[0]} is underpriced",
@@ -1101,6 +1113,57 @@ class Bot:
             notify(f"\u2694\uFE0F {LABEL} MOMENTUM SHIFT: {side} now pushing harder",
                    f"{self.press_line()}\nThe other side was ahead a minute ago. {mins(secs)} left.")
             print(f"[{stamp()}] MOMENTUM SHIFT -> {side} {tk} score={score}")
+
+    def is_waiting(self, tk):
+        return self.fifty.get(tk, {}).get("waiting", False)
+
+    def update_fifty(self, m, spot, sigma, now_t):
+        """When the round is about 50-50, hold all calls/entries/VALUE picks until one side takes a
+        CONFIRMED lead: blend at 58%+, pressure and the BTC model agree, and it holds for a few seconds."""
+        tk, strike = m["ticker"], m.get("floor_strike")
+        if strike is None or sigma is None:
+            return
+        close_t = parse_time(m["close_time"]).timestamp()
+        secs = close_t - now_t
+        ya, yb = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars")
+        if not (0 < yb <= ya < 1):
+            return
+        pm = prob_up(spot, float(strike), list(self.hist), now_t, close_t, sigma)
+        if pm is None:
+            return
+        p = (1 - MARKET_WEIGHT) * pm + MARKET_WEIGHT * (ya + yb) / 2
+        st = self.fifty.setdefault(tk, {"waiting": True, "since": now_t, "cand": None, "alerted": False})
+        dev = p - 0.5
+        side = "UP" if dev > 0 else "DOWN"
+        if not st["waiting"]:
+            if abs(dev) <= FIFTY_BAND:                      # slid back to 50-50: wait again
+                st.update(waiting=True, since=now_t, cand=None, alerted=False)
+            return
+        cp = self.cur_press or 0
+        press_ok = cp >= LEAD_MIN_PRESSURE if side == "UP" else cp <= -LEAD_MIN_PRESSURE
+        model_ok = (pm > 0.5) == (side == "UP")
+        if abs(dev) >= LEAD_EDGE and press_ok and model_ok:
+            if st["cand"] is None or st["cand"][0] != side:
+                st["cand"] = (side, now_t)
+            elif now_t - st["cand"][1] >= LEAD_CONFIRM_SECS:
+                st["waiting"] = False
+                print(f"[{stamp()}] LEAD FOUND {side} {tk} blend={p:.0%}")
+                if st["alerted"]:
+                    notify(f"\U0001F3C1 {LABEL} LEAD FOUND: {side} is taking the lead",
+                           f"{lean_tag(p)[0]}\nSnipe: {self.snipe_label()}\n"
+                           f"\u2694\uFE0F Pressure: {self.press_line()}\n"
+                           f"{mins(secs)} left | spot ${spot:,.2f} vs strike ${float(strike):,.2f}\n"
+                           f"The 50-50 is over. Normal calls and entries are back on.")
+        else:
+            st["cand"] = None
+            if not st["alerted"] and now_t - st["since"] >= WAIT_ALERT_SECS:
+                st["alerted"] = True
+                notify(f"\u23F3 {LABEL} 50-50: WAITING for a leader",
+                       f"UP {p:.0%} / DOWN {1 - p:.0%} | {mins(secs)} left\n"
+                       f"\u2694\uFE0F Pressure: {self.press_line()}\n"
+                       f"No calls, entries or VALUE picks until one side takes a confirmed lead "
+                       f"({1 - (0.5 - LEAD_EDGE):.0%}+ with pressure and the BTC model agreeing for {LEAD_CONFIRM_SECS}s). "
+                       f"You will get a LEAD FOUND alert.")
 
     def snipe_label(self):
         s = self.cur_snipe
@@ -1254,7 +1317,8 @@ class Bot:
         against = rname == "TRENDING" and rdir != s["name"]    # cheap side is against a steady trend
         swing_ok, swing_txt = self.swing_proof(tk, s["name"], now_t)
         fair_ok = s["p_side"] >= s["target"]          # model must value this side at/above the exit price
-        enter = (s["enter"] and rname == "CHOPPY" and tk not in self.surged and swing_ok and fair_ok)
+        enter = (s["enter"] and rname == "CHOPPY" and tk not in self.surged and swing_ok and fair_ok
+                 and not self.is_waiting(tk))
         lean_dot = "\U0001F7E2" if lean_side == "UP" else "\U0001F534"
         common = (f"Snipe: {self.snipe_label()}\nFlip risk: {1 - lean_conf:.0%} | flipped {flips}x\n"
                   f"Market: {self.regime_label()}\n"
