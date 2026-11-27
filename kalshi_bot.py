@@ -101,6 +101,10 @@ PULSE_SECS = 30          # status update interval when there's no entry
 SURGE_MOVE = 0.35        # market price jump (35 points) from early in the window = "unexpected surge"
 SCALP_MAX_SPREAD = 0.03  # bid/ask gap must be tight so you can actually get out
 DECIDED_PRICE = 0.88     # if either side is priced 88%+ the round is decided: no scalps
+VERDICT_MIN_EDGE = 0.05  # VALUE call: BTC model must beat Kalshi's price by this much after fees
+VALUE_MIN_SECS = 90      # no VALUE alerts with under 1.5 min left
+VALUE_MIN_PRICE, VALUE_MAX_PRICE = 0.15, 0.85   # never call value on a side priced outside this range
+VALUE_COOLDOWN = 90      # secs between VALUE alerts for the same side
 SWING_WINDOW = 180       # swing proof: look at the last 3 minutes of this side's price
 SWING_MIN_MOVE = 0.04    # a swing = a move of at least 4 points one way, then back
 SWING_MIN_REVERSALS = 2  # needs at least 2 reversals, and the price must have been at the exit level recently
@@ -710,6 +714,7 @@ class Bot:
         self.scalp_pos, self.rotate_from, self.last_hold = {}, {}, {}
         self.tp_sent, self.end_sent, self.warn_sent = set(), set(), set()
         self.cur_press, self.press_hist, self.last_shift = None, deque(maxlen=200), {}
+        self.cur_verdict, self.last_value = None, {}
         self.first_mid, self.surged = {}, {}       # surge detection per ticker
         self.scalp_lean = {}                       # ticker -> (side, flip count) for scalp messages
         self.last_log, self.last_hb = 0.0, time.time()
@@ -819,6 +824,7 @@ class Bot:
         self.surge_check(m)                         # detect unexpected surges (explains late calls)
         self.update_regime(m, now_t)                # choppy vs steady one-sided
         self.update_pressure(m, spot, sigma, now_t) # which side is pushing harder
+        self.update_verdict(m, spot, sigma, now_t)  # where the BTC model disagrees with Kalshi's price
         self.scalp_check(m, spot, sigma, now_t)     # low-% side scalp signals (alert only)
         self.manage_position(m, now_t)              # take-profit / hold / cut / rotate alerts
         if not snap:
@@ -850,6 +856,7 @@ class Bot:
                     self.surged[tk] = (side_now, None, snap["mid"])
                 flips_n = max(self.lean.get(tk, (None, 0))[1], self.scalp_lean.get(tk, (None, 0))[1])
                 notify(f"Kalshi {LABEL} CALL", f"{lean_tag(snap['p_blend'])[0]}\n"
+                       f"{self.verdict_line()}\n"
                        f"Flip risk: {1 - conf_now:.0%} | flipped {flips_n}x\n"
                        f"Market: {self.regime_label()}\n"
                        f"\u2694\uFE0F Pressure: {self.press_line()}\n"
@@ -948,6 +955,59 @@ class Bot:
         if name == "DECIDED":
             return f"\U0001F512 DECIDED {d} (round is basically over, no scalps)"
         return "\u23F3 MIXED / unclear" if name == "MIXED" else "\u23F3 measuring..."
+
+    def model_trust(self):
+        n, mean, se, bm, bk = self.ledger.stats()
+        nb = self.ledger.nb
+        if nb < 30:
+            return f"model unproven: only {nb} rounds scored"
+        if bm < bk:
+            return f"model has beaten Kalshi's price over {nb} rounds"
+        return f"model has NOT beaten Kalshi's price over {nb} rounds, treat as weak"
+
+    def update_verdict(self, m, spot, sigma, now_t):
+        """Compare the bot's own BTC-based probability with Kalshi's price. Only a gap is real information."""
+        self.cur_verdict = None
+        tk, strike = m["ticker"], m.get("floor_strike")
+        if strike is None or sigma is None:
+            return
+        close_t = parse_time(m["close_time"]).timestamp()
+        secs = close_t - now_t
+        pm = prob_up(spot, float(strike), list(self.hist), now_t, close_t, sigma)   # raw model, not blended
+        ya, yb, na = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars"), num(m, "no_ask_dollars")
+        if pm is None or not (0 < yb <= ya < 1):
+            return
+        opts = []
+        if VALUE_MIN_PRICE <= ya <= VALUE_MAX_PRICE:
+            opts.append(("UP", ya, pm - ya - fee(ya)))
+        if VALUE_MIN_PRICE <= na <= VALUE_MAX_PRICE:
+            opts.append(("DOWN", na, (1 - pm) - na - fee(na)))
+        best = max(opts, key=lambda o: o[2]) if opts else None
+        self.cur_verdict = {"pm": pm, "mid": (ya + yb) / 2, "best": best, "spread": ya - yb, "secs": secs}
+        if (best and VERDICT_MIN_EDGE <= best[2] <= MAX_EDGE and ya - yb <= MAX_SPREAD and secs >= VALUE_MIN_SECS
+                and self.cur_regime[0] != "DECIDED"
+                and now_t - self.last_value.get((tk, best[0]), 0) >= VALUE_COOLDOWN):
+            self.last_value[(tk, best[0])] = now_t
+            notify(f"\U0001F3AF {LABEL} VALUE: {best[0]} is underpriced",
+                   f"{self.verdict_line()}\n{mins(secs)} left | spot ${spot:,.2f} vs strike ${float(strike):,.2f}\n"
+                   f"A mispricing estimate from the BTC model, NOT a guarantee. Alert only.")
+            print(f"[{stamp()}] VALUE {best[0]} {tk} edge={best[2]:+.2f}")
+
+    def verdict_line(self):
+        v = self.cur_verdict
+        if not v:
+            return "Verdict: measuring..."
+        pm, mid, best = v["pm"], v["mid"], v["best"]
+        trust = self.model_trust()
+        if best and best[2] > MAX_EDGE:
+            return f"Verdict: model and Kalshi disagree by too much (likely bad data). No pick.\n({trust})"
+        if best and best[2] >= VERDICT_MIN_EDGE and v["spread"] <= MAX_SPREAD:
+            side, price, edge = best
+            p_side, k_side = (pm, mid) if side == "UP" else (1 - pm, 1 - mid)
+            return (f"\U0001F3AF VALUE: {side} looks underpriced. BTC model {p_side:.0%} vs Kalshi {k_side:.0%} "
+                    f"(buy @ {price * 100:.0f}c, edge {edge:+.2f})\n({trust})")
+        return (f"Verdict: NO EDGE. BTC model says UP {pm:.0%}, Kalshi says UP {mid:.0%}. "
+                f"They agree, so there is no pick here.\n({trust})")
 
     def press_line(self):
         sc = self.cur_press
@@ -1120,7 +1180,7 @@ class Bot:
                 extra = "\nNo entry yet."
             # the lean goes first (title + first line) so the phone preview shows the favored side, not the cheap one
             notify(f"{LABEL} pulse | LEAN {lean_dot} {lean_side} {lean_conf:.0%}",
-                   f"Lean: {lean_txt}\n{common}{extra}")
+                   f"Lean: {lean_txt}\n{self.verdict_line()}\n{common}{extra}")
 
     def manage_position(self, m, now_t):
         """Track the open scalp (from the first ENTER alert) and say when to take profit, hold, cut or rotate."""
