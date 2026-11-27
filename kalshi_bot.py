@@ -1,26 +1,21 @@
 """
-Kalshi BTC 15-minute (KXBTC15M) bot v4 -- high-conviction mode, live green/red dashboard.
+Kalshi BTC 15-minute (KXBTC15M) bot -- Railway edition (headless, paper-trading by default).
 
-Signals blended into one probability:
-  1. Lognormal model (spot vs strike, realized vol, time left)
-  2. 60s momentum
-  3. Kalshi order-book imbalance
-  then shrunk toward the market price (guards against overconfidence).
-Trades only when edge (after fees) clears the profile's threshold.
-Every trade (live OR paper) is tracked to settlement and logged to trades.csv.
+Signals blended into one probability: lognormal model (spot vs strike, realized vol, time
+left), 60s momentum, order-book imbalance -- shrunk toward the market price. It only calls
+when the market is trending (not chopping), the lean is stable, and conviction is high.
+Every trade (paper or live) is tracked to settlement and logged to trades_v5.csv.
 
-Risk profiles (PROFILE env var): SAFE | BALANCED | COINFLIP
-  COINFLIP = aggressive: tiny edge threshold, big sizing, multiple open trades.
-  The daily loss stop stays on in every profile.
-
-Setup:
-  pip install requests cryptography
-  export KALSHI_KEY_ID=...  KALSHI_KEY_PATH=kalshi.pem
-  python kalshi_btc15_bot_v2.py
-Defaults: KALSHI_DEMO=true, DRY_RUN=true (paper trades, still settled + scored).
-Go live only with: KALSHI_DEMO=false DRY_RUN=false -- after days of paper results.
+Railway variables:
+  KALSHI_KEY_ID          your API key id
+  KALSHI_PRIVATE_KEY     the full PEM private key text (never commit it to GitHub)
+  KALSHI_DEMO=true       demo environment (default true)
+  DRY_RUN=true           paper trades only, no orders sent (default true)
+  PROFILE=SAFE           SAFE | BALANCED | COINFLIP
+  DATA_DIR=/data         add a Railway Volume mounted at /data so history survives redeploys
+Kill switch: create a file named STOP in DATA_DIR. Local dashboard: HEADLESS=false.
 """
-import base64, csv, math, os, sys, time, uuid
+import base64, csv, json, math, os, sys, time, uuid
 from collections import deque
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -30,9 +25,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 # ---------------- config ----------------
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"   # true = clean log lines (Railway)
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
 DEMO = os.getenv("KALSHI_DEMO", "true").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-PROFILE = os.getenv("PROFILE", "BALANCED").upper()
+PROFILE = os.getenv("PROFILE", "SAFE").upper()
 BASE = ("https://demo-api.kalshi.co/trade-api/v2" if DEMO
         else "https://api.elections.kalshi.com/trade-api/v2")
 SERIES = "KXBTC15M"
@@ -52,7 +50,12 @@ MAX_VOL_ANN = 1.5                        # skip if realized vol > 150% annualize
 MAX_SPOT_DIVERGENCE = 0.001              # skip if Coinbase vs Kraken differ > 0.1%
 POLL_SECS = 2
 VOL_WINDOW_SECS = 600
-CSV_PATH = "trades_v4.csv"
+CSV_PATH = os.path.join(DATA_DIR, "trades_v5.csv")
+VIEW = os.getenv("VIEW", "simple").lower()   # simple (default) | full
+MAX_TRADES_DAY = 12                          # hard cap on entries per day
+LOSS_COOLDOWN_SECS = 900                     # pause after 2 losses in a row
+STOP_FILE = os.path.join(DATA_DIR, "STOP")                           # create a file named STOP to halt new trades
+MIN_PAPER_TRADES = 30                        # paper trades required before real-money mode
 
 # ---------------- ANSI ----------------
 G, R, Y, C, D, B, RST = ("\033[92m", "\033[91m", "\033[93m", "\033[96m",
@@ -60,6 +63,10 @@ G, R, Y, C, D, B, RST = ("\033[92m", "\033[91m", "\033[93m", "\033[96m",
 
 
 def col(t, k): return f"{k}{t}{RST}"
+
+
+if HEADLESS:                      # no color codes in Railway logs
+    G = R = Y = C = D = B = RST = ""
 def sgn_col(x, txt): return col(txt, G if x > 0 else R if x < 0 else Y)
 def dot(ok): return col("●", G if ok else R)
 def arrow(x, dead=0): return col("▲", G) if x > dead else col("▼", R) if x < -dead else col("■", Y)
@@ -70,8 +77,13 @@ def clamp(x, lo, hi): return max(lo, min(hi, x))
 class Kalshi:
     def __init__(self):
         self.key_id = os.environ["KALSHI_KEY_ID"]
-        with open(os.environ["KALSHI_KEY_PATH"], "rb") as f:
-            self.pk = serialization.load_pem_private_key(f.read(), password=None)
+        pem = os.getenv("KALSHI_PRIVATE_KEY")
+        if pem:
+            pem = pem.strip().strip('"').replace("\\n", "\n").encode()
+        else:
+            with open(os.environ["KALSHI_KEY_PATH"], "rb") as f:
+                pem = f.read()
+        self.pk = serialization.load_pem_private_key(pem, password=None)
         self.s = requests.Session()
 
     def _headers(self, method, url):
@@ -319,13 +331,40 @@ class Bot:
         self.pnl = 0.0
         self.events = deque(maxlen=6)
         self.qh, self.lean = {}, {}
+        self.loss_streak, self.cooldown_until, self.trades_today = 0, 0.0, 0
+        self.day = datetime.now().date()
+        self.load_history()
         self.last_spot = None
         if not os.path.exists(CSV_PATH):
             with open(CSV_PATH, "w", newline="") as f:
                 csv.writer(f).writerow(["time", "ticker", "side", "count", "ask", "model_p",
-                                        "edge", "result", "won", "pnl", "mode", "conviction", "regime"])
+                                        "edge", "result", "won", "pnl", "mode", "conviction", "regime", "env"])
 
-    def log(self, msg, k=Y): self.events.append(f"{D}{datetime.now():%H:%M:%S}{RST} {col(msg, k)}")
+    def log(self, msg, k=Y):
+        self.events.append(f"{D}{datetime.now():%H:%M:%S}{RST} {col(msg, k)}")
+        if HEADLESS:
+            seen = self.__dict__.setdefault("_seen", {})
+            if time.time() - seen.get(msg, 0) > 30:      # don't spam repeated errors
+                seen[msg] = time.time()
+                print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}", flush=True)
+
+    def load_history(self):
+        """Reload past settled trades so the scorecard survives redeploys."""
+        if not os.path.exists(CSV_PATH):
+            return
+        today = datetime.now().date().isoformat()
+        try:
+            with open(CSV_PATH) as f:
+                for r in csv.DictReader(f):
+                    pnl = float(r["pnl"])
+                    self.done.append(dict(p=float(r["model_p"]), pnl=pnl,
+                                          won=r["won"] == "True"))
+                    if r["time"].startswith(today):
+                        self.pnl += pnl
+                        self.trades_today += 1
+            self.log(f"Loaded {len(self.done)} past trades from {CSV_PATH}", Y)
+        except Exception as e:
+            self.log(f"Could not load history: {e}", R)
 
     def settle(self):
         now = datetime.now(timezone.utc)
@@ -339,16 +378,26 @@ class Bot:
                 pnl, won = settle_pnl(pos["side"], m["result"], pos["count"], pos["ask"])
                 pos.update(pnl=pnl, won=won, result=m["result"])
                 self.pnl += pnl
+                self.loss_streak = 0 if won else self.loss_streak + 1
+                if self.loss_streak >= 2:
+                    self.cooldown_until = time.time() + LOSS_COOLDOWN_SECS
+                    self.loss_streak = 0
+                    self.log("2 losses in a row: pausing new trades for 15 min", Y)
                 self.open_pos.remove(pos); self.done.append(pos)
                 self.log(f"SETTLED {pos['side'].upper()} x{pos['count']} -> "
                          f"{'WIN' if won else 'LOSS'} ${pnl:+.2f}", G if won else R)
+                print("TRADE_RECORD " + json.dumps(dict(
+                    ticker=pos["ticker"], side=pos["side"], count=pos["count"], ask=pos["ask"],
+                    model_p=round(pos["p"], 4), result=m["result"], won=won, pnl=round(pos["pnl"], 2),
+                    conv=round(pos.get("conv", 0)), mode="paper" if DRY_RUN else "live")), flush=True)
                 with open(CSV_PATH, "a", newline="") as f:
                     csv.writer(f).writerow([datetime.now().isoformat(timespec="seconds"),
                                             pos["ticker"], pos["side"], pos["count"],
                                             pos["ask"], round(pos["p"], 4), round(pos["edge"], 4),
                                             m["result"], won, round(pnl, 2),
                                             "paper" if DRY_RUN else "live",
-                                            round(pos.get("conv", 0)), pos.get("regime")])
+                                            round(pos.get("conv", 0)), pos.get("regime"),
+                                            "demo" if DEMO else "prod"])
 
     def enter(self, m, a, side):
         d = a["sides"][side]
@@ -360,11 +409,68 @@ class Bot:
         if not DRY_RUN:
             self.k.buy(m["ticker"], side, count, int(round(d["ask"] * 100)))
         self.traded.add(m["ticker"])
+        self.trades_today += 1
         self.open_pos.append(dict(ticker=m["ticker"], side=side, count=count, ask=d["ask"],
                                   p=d["p"], edge=d["edge"], close=parse_close(m),
                                   conv=a["conv"], regime=a["regime"]))
         self.log(f"{'PAPER' if DRY_RUN else 'BUY'} {side.upper()} x{count} @ {d['ask']*100:.0f}c "
                  f"edge {d['edge']*100:+.1f}% conv {a['conv']:.0f}", C)
+
+    def headless(self, spot, div, sigma, info):
+        """One clean heartbeat line a minute (status changes and trades log separately)."""
+        now = time.time()
+        if now - self.__dict__.get("_hb", 0) < 60:
+            return
+        self._hb = now
+        vol = "{:.0f}%".format(sigma * math.sqrt(31536000) * 100) if sigma else "warming"
+        parts = [f"{m['ticker'][-12:]} {status} lean={a['lean']} conv={a['conv']:.0f} "
+                 f"regime={a['regime']} ({why})" for m, a, side, why, status, fails in info]
+        print(f"{datetime.now():%Y-%m-%d %H:%M:%S} HEARTBEAT BTC ${spot:,.0f} vol {vol} "
+              f"feed_gap {div*100:.3f}% | " + " || ".join(parts or ["no open market"])
+              + f" | open {len(self.open_pos)} today ${self.pnl:+.2f}", flush=True)
+        if now - self.__dict__.get("_sc", 0) > 600:
+            self._sc = now
+            print(f"{datetime.now():%Y-%m-%d %H:%M:%S} SCORECARD " + " | ".join(self.scorecard()),
+                  flush=True)
+
+    def bot_gates(self, side, why, status, fails):
+        """Bot-level safety rails: kill switch, loss cooldown, daily trade cap."""
+        now = time.time()
+        if datetime.now().date() != self.day:
+            self.day, self.trades_today = datetime.now().date(), 0
+        block = None
+        if os.path.exists(STOP_FILE):
+            block = "Kill switch: STOP file found, delete it to resume"
+        elif now < self.cooldown_until:
+            block = f"Cooldown after 2 losses in a row ({int(self.cooldown_until - now)}s left)"
+        elif self.trades_today >= MAX_TRADES_DAY:
+            block = f"Daily trade cap reached ({MAX_TRADES_DAY})"
+        if block:
+            return None, block, "WAIT", [block] + fails
+        return side, why, status, fails
+
+    def scorecard(self):
+        """Honest running report: is the edge real, and is the model overconfident?"""
+        n = len(self.done)
+        w = sum(1 for p in self.done if p["won"])
+        lines = [f"Trades today {self.trades_today}/{MAX_TRADES_DAY}"]
+        if n == 0:
+            lines.append(col("Scorecard: no settled trades yet", Y))
+            return lines
+        tot = sum(p["pnl"] for p in self.done)
+        wr = w / n
+        avg_p = sum(p["p"] for p in self.done) / n
+        lines.append(f"Predicted win {avg_p*100:.0f}% vs actual {wr*100:.0f}%   "
+                     f"total ${tot:+.2f}  avg ${tot / n:+.2f}/trade")
+        if n < 20:
+            lines.append(col(f"Edge NOT PROVEN yet ({n}/20 trades)", Y))
+        elif tot > 0 and wr >= avg_p - 0.05:
+            lines.append(col("Edge looks real so far (keep paper trading to confirm)", G))
+        else:
+            lines.append(col("No proven edge: do NOT go live", R))
+        if n >= 20 and wr < avg_p - 0.10:
+            lines.append(col("Model is overconfident: raise the edge threshold", Y))
+        return lines
 
     def read_market(self, m, spot, sigma, mom, imb, now):
         """Build the full 'market read': regime, whipsaw, lean persistence, conviction."""
@@ -430,6 +536,23 @@ class Bot:
         out.append("─" * 62)
         for m, a, side, why, status, fails in markets_info:
             mm, ss = divmod(int(max(a['secs'], 0)), 60)
+            if VIEW != "full":
+                above = a["dist"] >= 0
+                pos_t = col("ABOVE" if above else "BELOW", G if above else R)
+                lean_t = col(a["lean"].upper(), G if a["lean"] == "yes" else R)
+                cv_t = col("{:.0f}/100".format(a["conv"]), G if a["conv"] >= PROF["min_conv"] else R)
+                dist_t = "${:,.0f}".format(abs(a["dist"]))
+                out.append(f"{B}{m['ticker'][-14:]}{RST}  {mm:02d}:{ss:02d} left")
+                out.append(f" BTC {pos_t} strike by {dist_t}   Lean {lean_t}   Conviction {cv_t}")
+                if status == "TRADE":
+                    out.append(" " + col(why, G))
+                elif status == "WATCH":
+                    out.append(" " + col(why, Y))
+                else:
+                    for fr in fails[:3]:
+                        out.append(" " + col("- " + fr, R))
+                out.append("")
+                continue
             pos_txt = col("ABOVE strike", G) if a["dist"] >= 0 else col("BELOW strike", R)
             out.append(f"{B}{m['ticker']}{RST}  closes in {mm:02d}:{ss:02d}")
             dist_txt = "{:+,.0f}$".format(a["dist"])
@@ -481,6 +604,7 @@ class Bot:
                    f"bal ${self.bal:,.2f}")
         out.append(f"Loss stop: -${PROF['loss_stop']}   "
                    f"{dot(self.pnl > -PROF['loss_stop'])} within limit")
+        out.extend(self.scorecard())
         for p in self.open_pos:
             out.append(f" {col('OPEN', C)} {p['side'].upper()} x{p['count']} @ {p['ask']*100:.0f}c "
                        f"({p['ticker'][-12:]})")
@@ -509,6 +633,7 @@ class Bot:
                         a = self.read_market(m, spot, sigma, mom, self.k.book_imbalance(m["ticker"]), now)
                         side, why, status, fails = decide(a, m["ticker"], self.open_pos,
                                                           self.traded, div, sigma, self.pnl)
+                        side, why, status, fails = self.bot_gates(side, why, status, fails)
                         if side: self.enter(m, a, side)
                         info.append((m, a, side, why, status, fails))
                 top = info[0][4] if info else "WAIT"
@@ -517,7 +642,10 @@ class Bot:
                     reason = info[0][3] if info else "no market"
                     self.log(f"Status -> {top}: {reason}",
                              G if top == "TRADE" else Y if top == "WATCH" else R)
-                self.render(spot, cb, kr, div, sigma, mom, info)
+                if HEADLESS:
+                    self.headless(spot, div, sigma, info)
+                else:
+                    self.render(spot, cb, kr, div, sigma, mom, info)
             except KeyboardInterrupt:
                 raise
             except requests.RequestException as e:
@@ -527,11 +655,78 @@ class Bot:
             time.sleep(POLL_SECS)
 
 
+def paper_record():
+    """(settled non-prod trades, total pnl) from the CSV log."""
+    n, pnl = 0, 0.0
+    try:
+        with open(CSV_PATH) as f:
+            for r in csv.DictReader(f):
+                if r.get("env") != "prod":
+                    n += 1; pnl += float(r["pnl"])
+    except Exception:
+        pass
+    return n, pnl
+
+
+def preflight():
+    """Startup self-check. Prints green/red checks and exits if something is wrong."""
+    bad = []
+    print(f"{B}Startup check{RST}  profile={PROFILE}  view={VIEW}")
+
+    def chk(label, fn):
+        try:
+            print(f" {col('OK ', G)} {label}  {D}{fn()}{RST}")
+        except Exception as e:
+            bad.append(label)
+            print(f" {col('FAIL', R)} {label}  {col(str(e)[:100], R)}")
+
+    k = {}
+
+    def c_key():
+        if not (os.getenv("KALSHI_KEY_ID") and (os.getenv("KALSHI_PRIVATE_KEY")
+                                                 or os.getenv("KALSHI_KEY_PATH"))):
+            raise RuntimeError("set KALSHI_KEY_ID and KALSHI_PRIVATE_KEY")
+        k["c"] = Kalshi()
+        return "key loaded"
+    chk("API key", c_key)
+    if "c" in k:
+        chk("Kalshi login", lambda: "balance ${:,.2f} ({})".format(
+            k["c"].balance_usd(), "demo" if DEMO else "REAL MONEY"))
+
+        def c_mkt():
+            ms = k["c"].open_markets()
+            if not ms: raise RuntimeError("no open KXBTC15M market found")
+            if ms[0].get("floor_strike") is None:
+                raise RuntimeError("market has no floor_strike, check Kalshi API docs")
+            return f"{ms[0]['ticker']} strike {ms[0]['floor_strike']}"
+        chk("Open BTC 15m market", c_mkt)
+    chk("BTC price feeds", lambda: "${:,.0f}".format(get_spot()[0]))
+
+    if not DRY_RUN and not DEMO:
+        def c_gate():
+            n, pnl = paper_record()
+            if os.getenv("FORCE_LIVE") == "yes":
+                return "FORCE_LIVE override on"
+            if n < MIN_PAPER_TRADES or pnl <= 0:
+                raise RuntimeError(f"real money locked: need {MIN_PAPER_TRADES}+ profitable "
+                                   f"paper trades (have {n}, P&L ${pnl:+.2f})")
+            return f"{n} paper trades, P&L ${pnl:+.2f}"
+        chk("Real-money unlock", c_gate)
+    if bad:
+        print(col("\nFix the red items above, then run again.", R))
+        if HEADLESS:
+            time.sleep(60)          # avoid a rapid crash-restart loop on Railway
+        sys.exit(1)
+    print(col("\nAll checks passed. Starting...\n", G))
+
+
 if __name__ == "__main__":
+    preflight()
     bot = Bot()
     try:
         bot.run()
     except KeyboardInterrupt:
         n = len(bot.done); w = sum(1 for p in bot.done if p["won"])
         print(f"\nStopped. {n} settled trades, {w} wins, P&L ${bot.pnl:+.2f}. Log: {CSV_PATH}")
+        print("\n".join(bot.scorecard()))
         sys.exit(0)
