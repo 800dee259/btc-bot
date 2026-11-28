@@ -52,6 +52,7 @@ from datetime import datetime, timezone
 PROD = "https://external-api.kalshi.com/trade-api/v2"
 DEMO = "https://external-api.demo.kalshi.co/trade-api/v2"
 SERIES = "KXBTC15M"
+BUILD = "2026-11-27 compact-alerts"   # shown in the startup message so you can tell which version is running
 LABEL = "BTC"
 
 SPOT_SOURCES = {
@@ -559,6 +560,23 @@ def scalp_signal(m, spot, sigma, hist, now_t):
             "enter": edge >= SCALP_MIN_EDGE}
 
 
+def sd(x):
+    """Signed dollars, e.g. +$29 / -$12."""
+    return f"{'+' if x >= 0 else '-'}${abs(x):,.0f}"
+
+
+def arrow(side):
+    return "▲" if side == "UP" else "▼"
+
+
+def sdot(side):
+    return "🟢" if side == "UP" else "🔴"
+
+
+def lean_label(conf):
+    return "COIN FLIP" if conf < 0.60 else "RISKY" if conf < 0.75 else "LEANING" if conf < 0.90 else "STRONG"
+
+
 STRATEGY = "Edge"   # label shown after the coin in trade messages (change to anything)
 MODE_LABEL = {"LIVE": "\U0001F534 Live", "DEMO": "\U0001F9EA Demo",
               "PAPER": "\U0001F4DD Paper", "DRY RUN": "\U0001F4DD Dry run"}
@@ -888,22 +906,19 @@ class Bot:
                 self.refresh_balance()
             if self.bal <= self.start_bal - MAX_DAILY_LOSS_USD:
                 print(f"[{stamp()}] daily loss limit reached (${self.bal:,.2f}). Stopping.")
-                notify("Kalshi bot STOPPED: daily loss limit", f"Balance ${self.bal:,.2f}", block=True)
+                notify("🛑 Stopped · daily loss limit", f"Balance ${self.bal:,.2f}", block=True)
                 return True
         if not self.once and time.time() - self.last_hb >= HEARTBEAT_SECS:
             self.last_hb = time.time()
             n, mean, se, bm, bk = self.stats_line()
-            notify("Kalshi bot alive", f"{self.trades_today} trades today | {n} tracked, avg {mean * 100:+.1f}c/contract\n"
-                   f"Calls: {streak_text(self.ledger.call_seq)}\nScalps: {streak_text(self.ledger.scalp_seq)}")
+            notify("💚 Bot alive", f"{self.trades_today} trades today · {n} tracked · avg {mean * 100:+.1f}c\nCalls: {streak_text(self.ledger.call_seq)}\nScalps: {streak_text(self.ledger.scalp_seq)}")
 
         m, m_t = self.watch.snap
         if self.market is not None and (m is None or m["ticker"] != self.market["ticker"]):
             old = self.market["ticker"]
             self.ledger.finish(old, self.scalp_pos.pop(old, None))
             if old not in self.called:
-                notify(f"\u23F8\uFE0F Kalshi {LABEL}: SAT OUT last round",
-                       f"No call was sent for {old}. Reason: {self.reason.get(old, 'never reached the trading window')}.\n"
-                       + self.surge_note(old))
+                notify("⏸ Sat out last round", f"{LABEL} · {old}\nReason: {self.reason.get(old, 'never reached the trading window')}\n" + self.surge_note(old))
         self.market = m
         if m is None:
             self._say("nomkt", "no open market found (watching for the next one)")
@@ -951,14 +966,12 @@ class Bot:
                 n = prev[1] + 1
                 self.lean[tk] = (side_now, n)
                 print(f"[{stamp()}] \U0001F504 FLIP {tk}: now {lean_tag(snap['p_blend'])[0]} | flipped {n}x this window")
-                notify(f"\U0001F504 Kalshi {LABEL} FLIP", f"{lean_tag(snap['p_blend'])[0]}\n"
-                       f"Flipped {n}x this window. {mins(snap['secs_left'])} left, spot ${spot:,.2f} vs strike ${snap['strike']:,.2f}.")
+                notify("🔄 Lean flipped", f"{LABEL} {arrow(side_now)} {side_now} · {conf_now:.0%} {lean_label(conf_now).title()}\nFlipped {n}x · ⏱ {mins(snap['secs_left'])} left · {sd(spot - snap['strike'])} vs strike")
             elif not prev:
                 self.lean[tk] = (side_now, 0)
             if tk in self.coinflip and conf_now >= 0.75:
                 self.coinflip.discard(tk)
-                notify(f"\u2705 Kalshi {LABEL}: RISK DROPPED", f"{lean_tag(snap['p_blend'])[0]}\n"
-                       f"{mins(snap['secs_left'])} left. This was a coin flip earlier; it is a firmer call now.")
+                notify("✅ Risk dropped", f"{LABEL} {arrow(side_now)} {side_now} · {conf_now:.0%} {lean_label(conf_now).title()}\n⏱ {mins(snap['secs_left'])} left · firmer call now")
             if tk not in self.called and waiting:
                 self.sit_out(m, "it is 50-50 and no side has taken a confirmed lead yet")
             if tk not in self.called and not waiting:   # one call per window, once a side leads
@@ -971,19 +984,12 @@ class Bot:
                 if tk not in self.surged and tk not in self.last_scalp and conf_now >= 0.90:
                     self.surged[tk] = (side_now, None, snap["mid"])
                 flips_n = max(self.lean.get(tk, (None, 0))[1], self.scalp_lean.get(tk, (None, 0))[1])
-                notify(f"Kalshi {LABEL} CALL", f"{lean_tag(snap['p_blend'])[0]}\n"
-                       f"{self.verdict_line()}\n"
-                       f"Flip risk: {1 - conf_now:.0%} | flipped {flips_n}x\n"
-                       f"{self.gap_line()}\n"
-                       f"Snipe: {self.snipe_label()}\n"
-                       f"Market: {self.regime_label()}\n"
-                       f"\u2694\uFE0F Pressure: {self.press_line()}\n"
-                       f"{mins(snap['secs_left'])} left | spot ${spot:,.2f} vs strike ${snap['strike']:,.2f} "
-                       f"({spot - snap['strike']:+,.0f})\nKalshi: YES ask {ya * 100:.0f}c / NO ask {na * 100:.0f}c\n"
-                       + ("\u23F8\uFE0F SIT OUT: this is a coin flip. Wait, risk drops later in the window; "
-                          "you will get a RISK DROPPED alert if it firms up.\n" if flip else "")
-                       + self.surge_note(tk)
-                       + "Alert only, no order placed.")
+                notify(f"{sdot(side_now)} Call · 🔔 Alert",
+                       f"{LABEL} {arrow(side_now)} {side_now} · {conf_now:.0%} {lean_label(conf_now).title()}\n"
+                       f"{self.verdict_short()}\n{self.ind_lines()}\n"
+                       f"⏱ {mins(snap['secs_left'])} left · YES {ya * 100:.0f}c / NO {na * 100:.0f}c"
+                       + ("\n⏸️ Sit out: coin flip, wait for RISK DROPPED" if flip else "")
+                       + ("\n" + self.surge_note(tk).strip() if self.surge_note(tk) else ""))
         tries, next_try = self.attempts.get(tk, (0, 0.0))
         will_act = bool(action) and tk not in self.traded and self.trades_today < MAX_TRADES_PER_DAY \
             and now_t >= next_try and not waiting
@@ -1016,10 +1022,9 @@ class Bot:
         self.ledger.add_open(tk, side, conf)
         hit, n = self.ledger.open_stats()
         rec_txt = f"Opening-call record: {hit}/{n} ({hit / n:.0%})" if n else "Opening-call record: no results yet"
-        notify(f"\u26A1 {LABEL} OPENING CALL",
-               f"{txt}\n{mins(secs)} left | spot ${spot:,.2f} vs strike ${strike:,.2f} ({spot - strike:+,.0f})\n"
-               f"Early read with ~15 min to go: far less certain than the late call, "
-               f"price can still swing either way. {rec_txt}.")
+        notify("⚡ Opening call",
+               f"{LABEL} {arrow(side)} {side} · {conf:.0%} {lean_label(conf).title()}\n"
+               f"⏱ {mins(secs)} left · {sd(spot - strike)} vs strike\nEarly read · {rec_txt}")
         print(f"[{stamp()}] OPENING CALL {tk}: {txt}")
 
     def surge_check(self, m):
@@ -1039,15 +1044,10 @@ class Bot:
         side = "UP" if mid >= 0.5 else "DOWN"
         if first is not None and abs(mid - first) >= SURGE_MOVE:
             self.surged[tk] = (side, first, mid)
-            notify(f"\U0001F680 {LABEL} SURGE {side}",
-                   f"Unexpected sudden move: market went {first:.0%} -> {mid:.0%} on UP with {mins(secs)} left.\n"
-                   f"The price jumped too fast to enter safely, so NO early calls this round. "
-                   f"The bot will send its normal call in the last 4 minutes.")
+            notify(f"🚀 Surge {side}", f"{LABEL} UP {first:.0%} → {mid:.0%} · ⏱ {mins(secs)} left\nNo early calls this round")
         elif first is None and (mid >= 0.85 or mid <= 0.15):
             self.surged[tk] = (side, None, mid)
-            notify(f"\U0001F680 {LABEL} ONE-SIDED MARKET",
-                   f"Market is already {mid:.0%} on UP with {mins(secs)} left. No safe entry, so NO early calls. "
-                   f"The bot will send its normal call in the last 4 minutes.")
+            notify("🚀 One-sided market", f"{LABEL} UP {mid:.0%} · ⏱ {mins(secs)} left\nNo safe early entry, no early calls")
         else:
             return
         print(f"[{stamp()}] SURGE {side} {tk}: {self.surged[tk]}")
@@ -1058,11 +1058,64 @@ class Bot:
             return ""
         side, first, mid = s
         if first is None:
-            why = f"the market moved sharply {side} early and stayed one-sided ({mid:.0%} on UP)"
-        else:
-            why = f"unexpected {side} surge, market went {first:.0%} -> {mid:.0%}"
-        return (f"\U0001F680 WHY NO EARLIER CALLS: {why}. "
-                f"There was no safe entry, so the bot sat out the round and is calling it now.\n")
+            return f"🚀 No early calls: market went {side} early ({mid:.0%} UP)\n"
+        return f"🚀 No early calls: {side} surge {first:.0%} → {mid:.0%}\n"
+
+    def regime_short(self):
+        name, d = self.cur_regime[0], self.cur_regime[1]
+        if name == "CHOPPY":
+            return "🔀 Choppy"
+        if name == "TRENDING":
+            return f"➡️ Steady {d}"
+        if name == "DECIDED":
+            return f"🔒 Decided {d}"
+        return "⏳ Mixed" if name == "MIXED" else "⏳ Measuring"
+
+    def gap_short(self):
+        g = self.cur_gap
+        if not g:
+            return "📏 Gap measuring"
+        other = "DOWN" if g["lead"] == "UP" else "UP"
+        reach = "in reach" if g["z"] <= GAP_REACH_Z else "possible" if g["z"] <= 1.5 else "far"
+        return f"📏 {sd(g['gap'])} vs strike · {other} {reach}"
+
+    def press_short(self):
+        sc = self.cur_press
+        if sc is None:
+            return "⚔️ Pressure measuring"
+        up = (sc + 100) // 2
+        tag = "even" if abs(sc) < 15 else f"{'UP' if sc > 0 else 'DOWN'} {'pushing' if abs(sc) >= 40 else 'edging'}"
+        return f"⚔️ UP {up}% / DOWN {100 - up}% ({tag})"
+
+    def snipe_short(self):
+        s = self.cur_snipe
+        if not s or s[0] < SNIPE_WATCH:
+            return "🎯 Snipe none"
+        lvl = "IMMINENT" if s[0] >= SNIPE_STRONG else "BUILDING" if s[0] >= SNIPE_BUILD else "WATCH"
+        return f"🎯 {lvl} {s[1]} {s[0]}/100"
+
+    def ind_lines(self):
+        return f"{self.gap_short()}\n{self.press_short()}\n{self.snipe_short()} · {self.regime_short()}"
+
+    def trust_short(self):
+        nb = self.ledger.nb
+        if nb < 30:
+            return f"Model unproven ({nb} rounds scored)"
+        n, mean, se, bm, bk = self.ledger.stats()
+        return f"Model beat Kalshi over {nb} rounds" if bm < bk else f"Model has NOT beaten Kalshi ({nb} rounds)"
+
+    def verdict_short(self):
+        v = self.cur_verdict
+        if not v:
+            return "🎯 Verdict measuring"
+        pm, mid, best = v["pm"], v["mid"], v["best"]
+        if best and best[2] > MAX_EDGE:
+            return "🎯 No pick (model and Kalshi too far apart)"
+        if best and best[2] >= VERDICT_MIN_EDGE and v["spread"] <= MAX_SPREAD:
+            side = best[0]
+            p_side, k_side = (pm, mid) if side == "UP" else (1 - pm, 1 - mid)
+            return f"🎯 VALUE {side} · model {p_side:.0%} vs Kalshi {k_side:.0%}"
+        return f"🎯 No edge · model UP {pm:.0%} vs Kalshi {mid:.0%}"
 
     def regime_label(self):
         name, d = self.cur_regime[0], self.cur_regime[1]
@@ -1106,10 +1159,10 @@ class Bot:
                 and self.cur_regime[0] != "DECIDED" and not self.is_waiting(tk)
                 and now_t - self.last_value.get((tk, best[0]), 0) >= VALUE_COOLDOWN):
             self.last_value[(tk, best[0])] = now_t
-            notify(f"\U0001F3AF {LABEL} VALUE: {best[0]} is underpriced",
-                   f"{self.verdict_line()}\n{self.gap_line()}\nSnipe: {self.snipe_label()}\n"
-                   f"{mins(secs)} left | spot ${spot:,.2f} vs strike ${float(strike):,.2f}\n"
-                   f"A mispricing estimate from the BTC model, NOT a guarantee. Alert only.")
+            notify(f"🎯 Value · {best[0]} underpriced",
+                   f"{LABEL} {arrow(best[0])} {best[0]} · buy @ {best[1] * 100:.0f}c · edge {best[2]:+.2f}\n"
+                   f"{self.verdict_short()}\n{self.ind_lines()}\n"
+                   f"⏱ {mins(secs)} left · {sd(spot - float(strike))} vs strike\n🧪 {self.trust_short()}")
             print(f"[{stamp()}] VALUE {best[0]} {tk} edge={best[2]:+.2f}")
 
     def verdict_line(self):
@@ -1164,8 +1217,7 @@ class Bot:
             self.last_shift[tk] = now_t
             side = "UP" if score > 0 else "DOWN"
             secs = parse_time(m["close_time"]).timestamp() - now_t
-            notify(f"\u2694\uFE0F {LABEL} MOMENTUM SHIFT: {side} now pushing harder",
-                   f"{self.press_line()}\nThe other side was ahead a minute ago. {mins(secs)} left.")
+            notify(f"⚔️ Momentum shift · {side}", f"{LABEL} {arrow(side)} {side} now pushing harder\n{self.press_short()}\n⏱ {mins(secs)} left")
             print(f"[{stamp()}] MOMENTUM SHIFT -> {side} {tk} score={score}")
 
     def gap_line(self):
@@ -1209,16 +1261,16 @@ class Bot:
         ya, na = num(m, "yes_ask_dollars"), num(m, "no_ask_dollars")
         where = "above" if gap >= 0 else "below"
         if crossed:
-            title = f"\U0001F504 {LABEL} CROSSED {where.upper()} STRIKE: {lead} now winning"
+            title = f"🔄 Crossed {where} strike · {lead} winning"
         else:
-            title = (f"{'\U0001F4C8' if gap >= 0 else '\U0001F4C9'} {LABEL} MORE {where.upper()}: "
-                     f"${abs(gap):,.0f} {where} strike")
+            title = f"{'📈' if gap >= 0 else '📉'} More {where} · {sd(gap)}"
+        tr = self.gap_track.get(tk, {"cross": 0, "lo": gap, "hi": gap})
         notify(title,
-               f"{lead} winning, BTC ${abs(gap):,.0f} {where} the strike"
-               + ("" if crossed else f" (+${moved:,.0f} further out)") + f"{mine}\n"
-               f"{self.gap_line()}\n"
-               f"Kalshi: YES ask {ya * 100:.0f}c / NO ask {na * 100:.0f}c\n"
-               f"{mins(secs)} left | spot ${spot:,.2f} vs strike ${strike:,.2f}\nAlert only.")
+               f"{LABEL} {arrow(lead)} {lead} winning"
+               + ("" if crossed else f" · +${moved:,.0f} further out") + f"{mine}\n"
+               f"{self.gap_short()}\n"
+               f"Crossed {tr['cross']}x · range {sd(tr['lo'])} to {sd(tr['hi'])}\n"
+               f"YES {ya * 100:.0f}c / NO {na * 100:.0f}c · ⏱ {mins(secs)} left")
         print(f"[{stamp()}] GAP MOVE {'CROSS' if crossed else 'MORE'} {where} {tk} gap={gap:+.0f}")
 
     def update_gap(self, m, spot, sigma, now_t):
@@ -1262,13 +1314,11 @@ class Bot:
         if now_t - self.last_gap_alert.get((tk, under), 0) < GAP_COOLDOWN:
             return
         self.last_gap_alert[(tk, under)] = now_t
-        notify(f"\U0001F4CF {LABEL} GAP: {under} in reach, BTC only ${abs(gap):,.0f} {'above' if gap >= 0 else 'below'} strike",
-               f"{self.gap_line()}\n"
-               f"{under} needs BTC to move ${abs(gap):,.0f} in {secs:.0f}s. Buy {under} @ {cost * 100:.0f}c | "
-               f"model {p_side:.0%} | edge {edge:+.2f}\n"
-               f"Snipe: {self.snipe_label()}\n\u2694\uFE0F Pressure: {self.press_line()}\n"
-               f"{mins(secs)} left | spot ${spot:,.2f} vs strike ${strike:,.2f}\n"
-               f"A gap indicator, NOT a guarantee. Alert only.")
+        notify(f"📏 Gap · {under} in reach",
+               f"{LABEL} {arrow(under)} {under} · buy @ {cost * 100:.0f}c · edge {edge:+.2f}\n"
+               f"BTC {sd(gap)} vs strike · needs ${abs(gap):,.0f} in {secs:.0f}s\n"
+               f"Model {p_side:.0%} · {self.snipe_short()} · {self.press_short()}\n"
+               f"⏱ {mins(secs)} left")
         print(f"[{stamp()}] GAP {under} in reach {tk} gap={gap:+.0f} z={z:.2f} edge={edge:+.2f}")
 
     def is_waiting(self, tk):
@@ -1306,21 +1356,16 @@ class Bot:
                 st["waiting"] = False
                 print(f"[{stamp()}] LEAD FOUND {side} {tk} blend={p:.0%}")
                 if st["alerted"]:
-                    notify(f"\U0001F3C1 {LABEL} LEAD FOUND: {side} is taking the lead",
-                           f"{lean_tag(p)[0]}\nSnipe: {self.snipe_label()}\n"
-                           f"\u2694\uFE0F Pressure: {self.press_line()}\n"
-                           f"{mins(secs)} left | spot ${spot:,.2f} vs strike ${float(strike):,.2f}\n"
-                           f"The 50-50 is over. Normal calls and entries are back on.")
+                    notify(f"🏁 Lead found · {side}",
+                           f"{LABEL} {arrow(side)} {side} · {p:.0%} {lean_label(max(p, 1 - p)).title()}\n{self.ind_lines()}\n"
+                           f"⏱ {mins(secs)} left · 50-50 over, calls back on")
         else:
             st["cand"] = None
             if not st["alerted"] and now_t - st["since"] >= WAIT_ALERT_SECS:
                 st["alerted"] = True
-                notify(f"\u23F3 {LABEL} 50-50: WAITING for a leader",
-                       f"UP {p:.0%} / DOWN {1 - p:.0%} | {mins(secs)} left\n"
-                       f"\u2694\uFE0F Pressure: {self.press_line()}\n"
-                       f"No calls, entries or VALUE picks until one side takes a confirmed lead "
-                       f"({1 - (0.5 - LEAD_EDGE):.0%}+ with pressure and the BTC model agreeing for {LEAD_CONFIRM_SECS}s). "
-                       f"You will get a LEAD FOUND alert.")
+                notify("⏳ 50-50 · Waiting for a leader",
+                       f"{LABEL} UP {p:.0%} / DOWN {1 - p:.0%}\n{self.press_short()}\n"
+                       f"⏱ {mins(secs)} left · needs {0.5 + LEAD_EDGE:.0%}+ with pressure and model for {LEAD_CONFIRM_SECS}s")
 
     def snipe_label(self):
         s = self.cur_snipe
@@ -1370,16 +1415,14 @@ class Bot:
         mine = held or lean
         against = mine is not None and mine != d
         name = ("IMMINENT", "BUILDING", "WATCH")[3 - lvl]
-        title = (f"\U0001F6A8 {LABEL} SNIPE {name} {d}"
-                 + (f": AGAINST your {held}" if against and held
-                    else f": against the {lean} lean" if against else ""))
+        title = (f"🚨 Snipe {name} {d}"
+                 + (f" · against your {held}" if against and held
+                    else f" · against the {lean} lean" if against else ""))
         action = ("Consider exiting or tightening your stop NOW." if against and lvl >= 2
-                  else "Stay alert, don't add to your side." if against else "It is moving with your side.")
-        notify(title, f"Strength {sc}/100 ({name})\n{snipe_bar(sc)}\n"
-               f"Speed {parts['speed']:.0%} | Acceleration {parts['accel']:.0%} | "
-               f"Closing on strike {parts['reach']:.0%} | Kalshi jumping {parts['kalshi']:.0%}\n"
-               f"{action}\n{self.gap_line()}\n{mins(secs)} left | spot ${spot:,.2f} vs strike ${float(strike):,.2f}\n"
-               f"Early warning, NOT a guarantee. Alert only.")
+                  else "Stay alert, don't add to your side." if against else "Moving with your side.")
+        notify(title, f"Strength {sc}/100\n{snipe_bar(sc)}\n"
+               f"Speed {parts['speed']:.0%} · Accel {parts['accel']:.0%} · Near strike {parts['reach']:.0%} · Kalshi {parts['kalshi']:.0%}\n"
+               f"{action}\n{self.gap_short()}\n⏱ {mins(secs)} left")
         print(f"[{stamp()}] SNIPE {name} {d} {tk} score={sc} against={against}")
 
     def swing_proof(self, tk, side, now_t):
@@ -1445,12 +1488,10 @@ class Bot:
                 and now_t - self.last_regime_alert >= 60:
             self.last_regime_alert = now_t
             if new[0] == "CHOPPY":
-                txt = ("Price is swinging up and down with no clear direction. This is NOT an entry signal. "
-                       "Only buy if you get a \u26A1 ENTER alert, which is sent only when price, time and edge all pass.")
+                txt = "Swinging up and down, no clear side. Wait for a ⚡ Scalp entry"
             else:
-                txt = (f"Price is moving steadily {new[1]}. Hold with the trend, take profit on target, and do NOT "
-                       f"buy the cheap side against it.")
-            notify(f"{self.regime_label()}", f"{txt}\n{mins(secs)} left.")
+                txt = f"Steady {new[1]} move. Hold with it, don't buy the cheap side against it"
+            notify(self.regime_short(), f"{txt}\n⏱ {mins(secs)} left")
             print(f"[{stamp()}] REGIME {new[0]} {new[1] or ''} {tk}")
 
     def scalp_check(self, m, spot, sigma, now_t):
@@ -1467,7 +1508,7 @@ class Bot:
             flips += 1
             self.scalp_lean[tk] = (lean_side, flips)
             if s["secs"] > MAX_SECS:       # inside the last 4 minutes the main FLIP alert handles it
-                notify(f"\U0001F504 {LABEL} FLIP", f"{lean_txt}\nFlipped {flips}x this window. {mins(s['secs'])} left.")
+                notify("🔄 Lean flipped", f"{LABEL} {arrow(lean_side)} {lean_side} · {lean_conf:.0%} {lean_label(lean_conf).title()}\nFlipped {flips}x · ⏱ {mins(s['secs'])} left")
         elif not prev:
             self.scalp_lean[tk] = (lean_side, 0)
         rname, rdir = self.cur_regime[0], self.cur_regime[1]
@@ -1487,35 +1528,33 @@ class Bot:
             rot = self.rotate_from.pop(tk, None)
             cents = f"{s['cost'] * 100:.0f}c"
             stop_c = max(0.01, s["cost"] - SCALP_STOP) * 100
-            title = (f"\U0001F501 {LABEL} SCALP: BUY {s['name']} @ {cents} (rotate)" if rot and rot != s["name"]
-                     else f"\u26A1 {LABEL} SCALP: BUY {s['name']} @ {cents}")
-            rel = (f"This is AGAINST the main lean ({lean_side}). " if lean_side != s["name"]
-                   else f"This is WITH the main lean ({lean_side}). ")
-            body = (f"{rel}Small size, quick exit, stop at {stop_c:.0f}c.\n"
-                    f"Win chance {s['p_side']:.0%} | edge {s['edge']:+.2f} | exit target {s['target'] * 100:.0f}c\n"
-                    f"Main lean: {lean_txt}\n{common}")
-            print(f"[{stamp()}] SCALP ENTER {body}")
-            notify(title, body + f"\nSwing proof: {swing_txt}\n"
-                   f"Evidence of a swing, NOT a guarantee. Alert only.")
+            title = (f"🔁 Scalp · ROTATE: BUY {s['name']} @ {cents}" if rot and rot != s["name"]
+                     else f"⚡ Scalp · BUY {s['name']} @ {cents}")
+            rel = f"Against main lean ({lean_side})" if lean_side != s["name"] else f"With main lean ({lean_side})"
+            body = (f"{LABEL} {arrow(s['name'])} {s['name']} · win {s['p_side']:.0%} · edge {s['edge']:+.2f}\n"
+                    f"🎯 Target {s['target'] * 100:.0f}c · 🛑 Stop {stop_c:.0f}c · {rel}\n"
+                    f"{self.ind_lines()}\n⏱ {mins(s['secs'])} left · Swing: {swing_txt}")
+            print(f"[{stamp()}] SCALP ENTER {title} | {body}")
+            notify(title, body)
         elif now_t - self.last_pulse.get(tk, 0) >= PULSE_SECS:
             self.last_pulse[tk] = now_t
             extra = ""
             if s["enter"] and not enter:
                 if against:
-                    extra = f"\nSteady {rdir} trend: this cheap side is against it, so no entry."
+                    extra = f"\nNo entry: steady {rdir} trend is against this side"
                 elif tk in self.surged:
-                    extra = "\nSurge this round: no scalp entries."
+                    extra = "\nNo entry: surge this round"
                 elif not swing_ok:
-                    extra = f"\nNo proven swing yet ({swing_txt}), so no entry."
+                    extra = f"\nNo entry: no proven swing ({swing_txt})"
                 elif not fair_ok:
-                    extra = "\nModel doesn't value this side up at the exit price, so no entry."
+                    extra = "\nNo entry: model doesn't value this side at the exit price"
                 else:
-                    extra = "\nMarket isn't clearly choppy, so no entry."
+                    extra = "\nNo entry: market isn't choppy"
             elif not s["enter"]:
-                extra = "\nNo entry yet."
-            # the lean goes first (title + first line) so the phone preview shows the favored side, not the cheap one
-            notify(f"{LABEL} pulse | LEAN {lean_dot} {lean_side} {lean_conf:.0%}",
-                   f"Lean: {lean_txt}\n{self.verdict_line()}\n{common}{extra}")
+                extra = "\nNo entry yet"
+            notify(f"📡 Pulse · {lean_dot} {lean_side} {lean_conf:.0%}",
+                   f"{self.verdict_short()}\n{self.ind_lines()}\n"
+                   f"⏱ {mins(s['secs'])} left · ${spot:,.2f} vs ${float(m['floor_strike']):,.2f}{extra}")
 
     def manage_position(self, m, now_t):
         """Track the open scalp (from the first ENTER alert) and say when to take profit, hold, cut or rotate."""
@@ -1549,25 +1588,24 @@ class Bot:
             danger = "\U0001F7E2 LOW"
         if exit_bid >= target:
             if rname == "CHOPPY":
-                adv = (f"Choppy market: the {other} side is now {other_cost * 100:.0f}c. Watch for a ROTATE alert "
-                       f"to scalp it back the other way.")
+                adv = f"Choppy: {other} side now {other_cost * 100:.0f}c, watch for a ROTATE alert"
                 self.rotate_from[tk] = name
             elif rname == "TRENDING" and rdir == name:
-                adv = f"Steady {name} trend, so it could run further, but profit is in hand. Take it, or hold with care."
+                adv = f"Steady {name} trend: could run further, but profit is in hand"
             else:
-                adv = "Take it. Don't chase more."
+                adv = "Take it, don't chase more"
             rec_txt = self.ledger.record_scalp(tk, True, "take_profit")
-            notify(f"\U0001F4B0 {LABEL} TAKE PROFIT: SELL {name} now",
-                   f"Exit ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c per contract).\n{adv}\n"
-                   f"{mins(secs)} left. Scalps: {rec_txt}. Alert only.")
+            notify(f"💰 Take profit · SELL {name}",
+                   f"{LABEL} {arrow(name)} {name} · {cost * 100:.0f}c → ~{exit_bid * 100:.0f}c ({pnl * 100:+.0f}c)\n"
+                   f"{adv}\n⏱ {mins(secs)} left · Scalps: {rec_txt}")
             print(f"[{stamp()}] TAKE PROFIT {name} {tk} exit={exit_bid:.2f} entry={cost:.2f}")
             self.scalp_pos.pop(tk, None)
             return
         if pnl <= -SCALP_STOP:
             rec_txt = self.ledger.record_scalp(tk, False, "cut")
-            notify(f"\U0001F6D1 {LABEL} CUT: SELL {name} (going against you)",
-                   f"Exit ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c per contract).\n"
-                   f"Market: {self.regime_label()}. Consider cutting the loss. Scalps: {rec_txt}. Alert only.")
+            notify(f"🛑 Cut · SELL {name}",
+                   f"{LABEL} {arrow(name)} {name} · {cost * 100:.0f}c → ~{exit_bid * 100:.0f}c ({pnl * 100:+.0f}c)\n"
+                   f"{self.regime_short()} · Scalps: {rec_txt}")
             print(f"[{stamp()}] CUT {name} {tk} exit={exit_bid:.2f} entry={cost:.2f}")
             self.scalp_pos.pop(tk, None)
             return
@@ -1575,46 +1613,39 @@ class Bot:
             self.warn_sent.add(tk)
             how = (f"fell {fast_drop * 100:.0f}c in the last {FLIP_FAST_SECS}s" if fast_drop >= FLIP_WARN_FAST_DROP
                    else f"fell {drop_peak * 100:.0f}c from its high of {peak * 100:.0f}c")
-            keep = " You are still in profit, so consider locking it in." if pnl > 0 else ""
-            notify(f"\u26A0\uFE0F {LABEL} FLIP WARNING: {name} is falling",
-                   f"{name} {how}, now ~{exit_bid * 100:.0f}c (entry {cost * 100:.0f}c, {pnl * 100:+.0f}c). "
-                   f"The market may be flipping to {other} ({other_cost * 100:.0f}c).{keep}\n"
-                   f"{self.gap_line()}\n"
-                   f"Snipe: {self.snipe_label()}\n"
-                   f"\u2694\uFE0F Pressure: {self.press_line()}\n"
-                   f"Consider exiting now to protect your money. Stop level: {stop_price * 100:.0f}c. "
-                   f"{mins(secs)} left. Alert only.")
+            keep = "\n💰 In profit: consider locking it in" if pnl > 0 else ""
+            notify(f"⚠️ Flip warning · {name} falling",
+                   f"{LABEL} {arrow(name)} {name} · {how}\nNow ~{exit_bid * 100:.0f}c · entry {cost * 100:.0f}c ({pnl * 100:+.0f}c)\n"
+                   f"Flipping to {other} ({other_cost * 100:.0f}c){keep}\n{self.gap_short()}\n"
+                   f"{self.snipe_short()} · {self.press_short()}\n🛑 Stop {stop_price * 100:.0f}c · ⏱ {mins(secs)} left")
             print(f"[{stamp()}] FLIP WARNING {name} {tk} exit={exit_bid:.2f} peak={peak:.2f}")
         elif not flipping and tk in self.warn_sent and drop_peak < 0.02:
             self.warn_sent.discard(tk)            # it recovered: allow a fresh warning later
         if secs <= END_WARN_SECS and tk not in self.end_sent:
             self.end_sent.add(tk)
-            notify(f"\u23F1\uFE0F {LABEL} ENDING SOON: {name} still open",
-                   f"{mins(secs)} left. Sell now at ~{exit_bid * 100:.0f}c, or hold to settlement "
-                   f"(pays 100c if {name} wins, 0 if not).")
+            notify(f"⏱ Ending soon · {name} open",
+                   f"{LABEL} {arrow(name)} {name} · {mins(secs)} left\nSell ~{exit_bid * 100:.0f}c or hold (pays $1 if {name} wins, $0 if not)")
             return
         if now_t - self.last_hold.get(tk, 0) >= HOLD_SECS:
             self.last_hold[tk] = now_t
             cp = self.cur_press or 0
-            against_txt = "\nPressure is AGAINST your side." if (name == "DOWN" and cp >= 40) or (name == "UP" and cp <= -40) else ""
+            against_txt = "\n⚠️ Pressure is against your side" if (name == "DOWN" and cp >= 40) or (name == "UP" and cp <= -40) else ""
             sn = self.cur_snipe
             if sn and sn[0] >= SNIPE_WATCH and sn[1] != name:
-                against_txt += "\n\U0001F6A8 SNIPE is AGAINST your side."
+                against_txt += "\n🚨 Snipe is against your side"
             if rname == "TRENDING" and rdir == name:
-                why = f"Steady {name} trend is with you. Hold toward the target."
+                why = "Trend is with you: hold to target"
             elif rname == "TRENDING":
-                why = f"Steady {rdir} trend is AGAINST you. Don't add; consider cutting if it keeps falling."
+                why = f"Steady {rdir} trend against you: don't add, consider cutting"
             elif rname == "CHOPPY":
-                why = (f"Choppy market: a dip can bounce back or keep falling. Don't hold past the stop "
-                       f"({stop_price * 100:.0f}c). You'll get a FLIP WARNING if it turns fast.")
+                why = f"Choppy: don't hold past {stop_price * 100:.0f}c"
             else:
-                why = "No clear trend yet. Hold for the target."
-            notify(f"\u270B {LABEL} HOLD {name}",
-                   f"Now ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c). "
-                   f"Target {target * 100:.0f}c | Stop {stop_price * 100:.0f}c.\n"
-                   f"{self.gap_line()}\n"
-                   f"Snipe: {self.snipe_label()}\n"
-                   f"Danger: {danger}\n\u2694\uFE0F Pressure: {self.press_line()}{against_txt}\n{why}\n{mins(secs)} left.")
+                why = "No clear trend: hold for target"
+            notify(f"✋ Hold · {name}",
+                   f"{LABEL} {arrow(name)} {name} · ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c)\n"
+                   f"🎯 {target * 100:.0f}c · 🛑 {stop_price * 100:.0f}c · Danger {danger}\n"
+                   f"{self.gap_short()}\n{self.press_short()} · {self.snipe_short()}{against_txt}\n"
+                   f"{why} · ⏱ {mins(secs)} left")
 
     def sit_out(self, m, reason):
         """Tell the group once per window that no call is coming yet, and why."""
@@ -1624,9 +1655,7 @@ class Bot:
         if tk in self.called or tk in self.sat_out or not (MIN_SECS < secs <= MAX_SECS):
             return
         self.sat_out.add(tk)
-        notify(f"\u23F8\uFE0F Kalshi {LABEL}: SITTING OUT (for now)",
-               f"No call yet, {mins(secs)} left. Reason: {reason}.\n"
-               f"Wait: a call will be sent if the data clears before the window ends.")
+        notify("⏸ Sitting out · for now", f"{LABEL} · {mins(secs)} left\nReason: {reason}\nA call comes if the data clears")
 
     def stats_line(self):
         return self.ledger.stats()
@@ -1683,7 +1712,7 @@ class Bot:
                 print(f"[{stamp()}] error: {e}")
                 if time.time() - self._err_alert > 900:
                     self._err_alert = time.time()
-                    notify("Kalshi bot error", str(e)[:300])
+                    notify("⚠️ Bot error", str(e)[:300])
             if self.once:
                 return
             time.sleep(max(0.0, POLL_SECS - (time.time() - t0)))
@@ -1722,15 +1751,16 @@ def main():
         return
     api = Kalshi(PROD if not a.demo else DEMO, key_id, key_path)
     mode = "LIVE (gated)" if a.live else "DEMO" if a.demo else "DRY RUN (paper only)"
-    print(f"Kalshi bot v3 ({SERIES}) | mode: {mode} | stake ${STAKE_USD:.2f}")
+    mode_key = "LIVE" if a.live else "DEMO" if a.demo else "DRY RUN"
+    print(f"Kalshi bot v3 ({SERIES}) | build {BUILD} | mode: {mode} | stake ${STAKE_USD:.2f}")
     if not a.once:
-        notify("Kalshi bot v3 started", f"Mode: {mode}")
+        notify("🟢 Bot started · " + MODE_LABEL[mode_key], f"Build: {BUILD}")
     try:
         Bot(api, send_orders=a.demo or a.live, gated=a.live, once=a.once).run()
     except KeyboardInterrupt:
-        notify("Kalshi bot stopped", "Stopped manually.", block=True)
+        notify("⏹ Bot stopped", "Stopped manually", block=True)
     except Exception as e:
-        notify("Kalshi bot CRASHED", f"{type(e).__name__}: {str(e)[:300]}", block=True)
+        notify("💥 Bot crashed", f"{type(e).__name__}: {str(e)[:300]}", block=True)
         raise
     finally:
         flush_alerts()
