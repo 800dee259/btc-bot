@@ -142,6 +142,16 @@ LEAD_MIN_PRESSURE = 20    # ...with the pressure score agreeing (20+ toward that
 LEAD_CONFIRM_SECS = 8     # ...and BTC model + all of it holding for this many seconds
 WAIT_ALERT_SECS = 20      # send the WAITING alert only if still 50-50 after this long (skips the normal window start)
 
+# ---- strike gap (dollars above/below the target) ----
+GAP_REACH_Z = 0.75        # other side is "IN REACH" when BTC is within 0.75 sigma of the strike for the time left
+GAP_MIN_SECS, GAP_MAX_SECS = 45, 600   # only alert with 45s-10min left
+GAP_COOLDOWN = 60         # secs between OTHER-SIDE alerts per side
+GAP_MIN_EDGE = 0.03       # model win chance for the other side must beat its price + fee by this
+GAP_MIN_PRICE, GAP_MAX_PRICE = 0.12, 0.45   # only the cheaper, trailing side
+GAP_STEP_SIGMAS = 1.0     # "more above / more below" alert each time the gap grows by this many typical 30s moves...
+GAP_STEP_MIN_USD = 10.0   # ...but never by less than this many dollars
+GAP_MOVE_COOLDOWN = 10    # min secs between these alerts per window (stops spam in a fast move)
+
 
 def stamp():
     return datetime.now().strftime("%H:%M:%S")
@@ -455,6 +465,15 @@ def snipe_score(hist, strike, sigma, now_t, secs, mid_move10):
     kal = clip(mid_move10 / 0.08) if (mid_move10 > 0) == (d == "UP") else 0.0
     score = round(100 * (0.30 * speed + 0.20 * accel + 0.30 * reach + 0.20 * kal))
     return score, d, {"speed": speed, "accel": accel, "reach": reach, "kalshi": kal}
+
+
+def gap_stats(spot, strike, sigma, secs):
+    """Dollars above/below the strike. z = gap in 'typical moves' for the time left;
+    touch = rough chance BTC trades through the strike at least once before close."""
+    gap = spot - strike
+    z = abs(gap) / (sigma * VOL_MULT * math.sqrt(max(secs, 1.0)))
+    touch = min(0.99, 2 * (1 - 0.5 * (1 + math.erf(z / math.sqrt(2)))))
+    return gap, ("UP" if gap >= 0 else "DOWN"), z, touch
 
 
 def snipe_bar(sc):
@@ -803,6 +822,8 @@ class Bot:
         self.cur_press, self.press_hist, self.last_shift = None, deque(maxlen=200), {}
         self.cur_snipe, self.snipe_sent = None, {}   # snipe detector state
         self.fifty = {}                              # ticker -> 50-50 wait state
+        self.cur_gap, self.gap_track, self.last_gap_alert = None, {}, {}   # strike gap tracking
+        self.gap_anchor = {}                         # ticker -> where the last "more above/below" alert fired
         self.cur_verdict, self.last_value = None, {}
         self.first_mid, self.surged = {}, {}       # surge detection per ticker
         self.scalp_lean = {}                       # ticker -> (side, flip count) for scalp messages
@@ -913,6 +934,7 @@ class Bot:
         self.surge_check(m)                         # detect unexpected surges (explains late calls)
         self.update_regime(m, now_t)                # choppy vs steady one-sided
         self.update_pressure(m, spot, sigma, now_t) # which side is pushing harder
+        self.update_gap(m, spot, sigma, now_t)      # dollars above/below the strike + other-side alerts
         self.snipe_check(m, spot, sigma, now_t)     # sudden sharp move toward flipping the round
         self.update_fifty(m, spot, sigma, now_t)    # 50-50: wait until one side takes a confirmed lead
         waiting = self.is_waiting(tk)
@@ -952,6 +974,7 @@ class Bot:
                 notify(f"Kalshi {LABEL} CALL", f"{lean_tag(snap['p_blend'])[0]}\n"
                        f"{self.verdict_line()}\n"
                        f"Flip risk: {1 - conf_now:.0%} | flipped {flips_n}x\n"
+                       f"{self.gap_line()}\n"
                        f"Snipe: {self.snipe_label()}\n"
                        f"Market: {self.regime_label()}\n"
                        f"\u2694\uFE0F Pressure: {self.press_line()}\n"
@@ -1084,7 +1107,7 @@ class Bot:
                 and now_t - self.last_value.get((tk, best[0]), 0) >= VALUE_COOLDOWN):
             self.last_value[(tk, best[0])] = now_t
             notify(f"\U0001F3AF {LABEL} VALUE: {best[0]} is underpriced",
-                   f"{self.verdict_line()}\nSnipe: {self.snipe_label()}\n"
+                   f"{self.verdict_line()}\n{self.gap_line()}\nSnipe: {self.snipe_label()}\n"
                    f"{mins(secs)} left | spot ${spot:,.2f} vs strike ${float(strike):,.2f}\n"
                    f"A mispricing estimate from the BTC model, NOT a guarantee. Alert only.")
             print(f"[{stamp()}] VALUE {best[0]} {tk} edge={best[2]:+.2f}")
@@ -1144,6 +1167,109 @@ class Bot:
             notify(f"\u2694\uFE0F {LABEL} MOMENTUM SHIFT: {side} now pushing harder",
                    f"{self.press_line()}\nThe other side was ahead a minute ago. {mins(secs)} left.")
             print(f"[{stamp()}] MOMENTUM SHIFT -> {side} {tk} score={score}")
+
+    def gap_line(self):
+        g = self.cur_gap
+        if not g:
+            return "\U0001F4CF Gap: measuring..."
+        sd = lambda x: f"{'+' if x >= 0 else '-'}${abs(x):,.0f}"
+        gap, lead, z, touch, tr = g["gap"], g["lead"], g["z"], g["touch"], g["track"]
+        other = "DOWN" if lead == "UP" else "UP"
+        reach = "IN REACH" if z <= GAP_REACH_Z else "POSSIBLE" if z <= 1.5 else "FAR"
+        return (f"\U0001F4CF BTC ${abs(gap):,.0f} {'above' if gap >= 0 else 'below'} strike ({lead} winning)\n"
+                f"   {other} side: {reach} ({z:.1f}\u03C3, ~{touch:.0%} to touch) | crossed {tr['cross']}x | "
+                f"range {sd(tr['lo'])} to {sd(tr['hi'])}")
+
+    def gap_move_alert(self, m, spot, sigma, now_t, gap, lead, secs):
+        """Watch the strike for the whole window. Alert each time BTC gets another step further ABOVE or
+        BELOW it, and when it CROSSES to the other side. Moving back toward the strike re-arms silently."""
+        tk, strike = m["ticker"], float(m["floor_strike"])
+        step = max(GAP_STEP_MIN_USD, GAP_STEP_SIGMAS * sigma * math.sqrt(30))
+        a = self.gap_anchor.get(tk)
+        if a is None:
+            self.gap_anchor[tk] = {"side": lead, "abs": abs(gap), "t": 0.0}
+            return
+        if abs(gap) < sigma * 2.0 and lead != a["side"]:
+            return                                          # hovering on the strike: not a real cross yet
+        crossed = lead != a["side"]
+        grew = (not crossed) and abs(gap) - a["abs"] >= step
+        if not crossed and not grew:
+            if a["abs"] - abs(gap) >= step:                 # eased back toward the strike: re-arm silently
+                a["abs"] = abs(gap)
+            return
+        if now_t - a["t"] < GAP_MOVE_COOLDOWN:
+            return
+        moved = abs(gap) - a["abs"]
+        a.update(side=lead, abs=abs(gap), t=now_t)
+        pos = self.scalp_pos.get(tk) or self.ledger.trades.get(tk)
+        held = pos["name"] if pos else None
+        mine = ""
+        if held:
+            mine = (f"\n\u2705 This helps your {held}." if held == lead else f"\n\u26A0\uFE0F This is AGAINST your {held}.")
+        ya, na = num(m, "yes_ask_dollars"), num(m, "no_ask_dollars")
+        where = "above" if gap >= 0 else "below"
+        if crossed:
+            title = f"\U0001F504 {LABEL} CROSSED {where.upper()} STRIKE: {lead} now winning"
+        else:
+            title = (f"{'\U0001F4C8' if gap >= 0 else '\U0001F4C9'} {LABEL} MORE {where.upper()}: "
+                     f"${abs(gap):,.0f} {where} strike")
+        notify(title,
+               f"{lead} winning, BTC ${abs(gap):,.0f} {where} the strike"
+               + ("" if crossed else f" (+${moved:,.0f} further out)") + f"{mine}\n"
+               f"{self.gap_line()}\n"
+               f"Kalshi: YES ask {ya * 100:.0f}c / NO ask {na * 100:.0f}c\n"
+               f"{mins(secs)} left | spot ${spot:,.2f} vs strike ${strike:,.2f}\nAlert only.")
+        print(f"[{stamp()}] GAP MOVE {'CROSS' if crossed else 'MORE'} {where} {tk} gap={gap:+.0f}")
+
+    def update_gap(self, m, spot, sigma, now_t):
+        """Track the dollar gap to the strike, and alert when the TRAILING side is within reach and cheap."""
+        tk, strike = m["ticker"], m.get("floor_strike")
+        self.cur_gap = None
+        if strike is None or sigma is None:
+            return
+        strike = float(strike)
+        close_t = parse_time(m["close_time"]).timestamp()
+        secs = close_t - now_t
+        if secs <= 0:
+            return
+        gap, lead, z, touch = gap_stats(spot, strike, sigma, secs)
+        tr = self.gap_track.setdefault(tk, {"hi": gap, "lo": gap, "cross": 0, "side": None})
+        tr["hi"], tr["lo"] = max(tr["hi"], gap), min(tr["lo"], gap)
+        if abs(gap) >= sigma * 2.0:                 # ignore wiggles smaller than this when counting crossings
+            if tr["side"] and tr["side"] != lead:
+                tr["cross"] += 1
+            tr["side"] = lead
+        self.cur_gap = {"gap": gap, "lead": lead, "z": z, "touch": touch, "track": tr}
+        self.gap_move_alert(m, spot, sigma, now_t, gap, lead, secs)   # runs the whole window
+        ya, yb, na = num(m, "yes_ask_dollars"), num(m, "yes_bid_dollars"), num(m, "no_ask_dollars")
+        if not (0 < yb <= ya < 1) or ya - yb > MAX_SPREAD:
+            return
+        if not (GAP_MIN_SECS <= secs <= GAP_MAX_SECS) or z > GAP_REACH_Z:
+            return
+        if self.cur_regime[0] == "DECIDED" or self.is_waiting(tk):
+            return
+        under = "DOWN" if lead == "UP" else "UP"    # the trailing side
+        cost = na if under == "DOWN" else ya
+        if not (GAP_MIN_PRICE <= cost <= GAP_MAX_PRICE):
+            return
+        pm = prob_up(spot, strike, list(self.hist), now_t, close_t, sigma)
+        if pm is None:
+            return
+        p_side = 1 - pm if under == "DOWN" else pm
+        edge = p_side - cost - fee(cost)
+        if not (GAP_MIN_EDGE <= edge <= MAX_EDGE):
+            return
+        if now_t - self.last_gap_alert.get((tk, under), 0) < GAP_COOLDOWN:
+            return
+        self.last_gap_alert[(tk, under)] = now_t
+        notify(f"\U0001F4CF {LABEL} GAP: {under} in reach, BTC only ${abs(gap):,.0f} {'above' if gap >= 0 else 'below'} strike",
+               f"{self.gap_line()}\n"
+               f"{under} needs BTC to move ${abs(gap):,.0f} in {secs:.0f}s. Buy {under} @ {cost * 100:.0f}c | "
+               f"model {p_side:.0%} | edge {edge:+.2f}\n"
+               f"Snipe: {self.snipe_label()}\n\u2694\uFE0F Pressure: {self.press_line()}\n"
+               f"{mins(secs)} left | spot ${spot:,.2f} vs strike ${strike:,.2f}\n"
+               f"A gap indicator, NOT a guarantee. Alert only.")
+        print(f"[{stamp()}] GAP {under} in reach {tk} gap={gap:+.0f} z={z:.2f} edge={edge:+.2f}")
 
     def is_waiting(self, tk):
         return self.fifty.get(tk, {}).get("waiting", False)
@@ -1252,7 +1378,7 @@ class Bot:
         notify(title, f"Strength {sc}/100 ({name})\n{snipe_bar(sc)}\n"
                f"Speed {parts['speed']:.0%} | Acceleration {parts['accel']:.0%} | "
                f"Closing on strike {parts['reach']:.0%} | Kalshi jumping {parts['kalshi']:.0%}\n"
-               f"{action}\n{mins(secs)} left | spot ${spot:,.2f} vs strike ${float(strike):,.2f}\n"
+               f"{action}\n{self.gap_line()}\n{mins(secs)} left | spot ${spot:,.2f} vs strike ${float(strike):,.2f}\n"
                f"Early warning, NOT a guarantee. Alert only.")
         print(f"[{stamp()}] SNIPE {name} {d} {tk} score={sc} against={against}")
 
@@ -1351,7 +1477,7 @@ class Bot:
         enter = (s["enter"] and rname == "CHOPPY" and tk not in self.surged and swing_ok and fair_ok
                  and not self.is_waiting(tk))
         lean_dot = "\U0001F7E2" if lean_side == "UP" else "\U0001F534"
-        common = (f"Snipe: {self.snipe_label()}\nFlip risk: {1 - lean_conf:.0%} | flipped {flips}x\n"
+        common = (f"{self.gap_line()}\nSnipe: {self.snipe_label()}\nFlip risk: {1 - lean_conf:.0%} | flipped {flips}x\n"
                   f"Market: {self.regime_label()}\n"
                   f"\u2694\uFE0F Pressure: {self.press_line()}\n"
                   f"{mins(s['secs'])} left | spot ${spot:,.2f} vs strike ${float(m['floor_strike']):,.2f}")
@@ -1453,6 +1579,7 @@ class Bot:
             notify(f"\u26A0\uFE0F {LABEL} FLIP WARNING: {name} is falling",
                    f"{name} {how}, now ~{exit_bid * 100:.0f}c (entry {cost * 100:.0f}c, {pnl * 100:+.0f}c). "
                    f"The market may be flipping to {other} ({other_cost * 100:.0f}c).{keep}\n"
+                   f"{self.gap_line()}\n"
                    f"Snipe: {self.snipe_label()}\n"
                    f"\u2694\uFE0F Pressure: {self.press_line()}\n"
                    f"Consider exiting now to protect your money. Stop level: {stop_price * 100:.0f}c. "
@@ -1485,6 +1612,7 @@ class Bot:
             notify(f"\u270B {LABEL} HOLD {name}",
                    f"Now ~{exit_bid * 100:.0f}c vs entry {cost * 100:.0f}c ({pnl * 100:+.0f}c). "
                    f"Target {target * 100:.0f}c | Stop {stop_price * 100:.0f}c.\n"
+                   f"{self.gap_line()}\n"
                    f"Snipe: {self.snipe_label()}\n"
                    f"Danger: {danger}\n\u2694\uFE0F Pressure: {self.press_line()}{against_txt}\n{why}\n{mins(secs)} left.")
 
