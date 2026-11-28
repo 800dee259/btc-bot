@@ -540,6 +540,36 @@ def scalp_signal(m, spot, sigma, hist, now_t):
             "enter": edge >= SCALP_MIN_EDGE}
 
 
+STRATEGY = "Edge"   # label shown after the coin in trade messages (change to anything)
+MODE_LABEL = {"LIVE": "\U0001F534 Live", "DEMO": "\U0001F9EA Demo",
+              "PAPER": "\U0001F4DD Paper", "DRY RUN": "\U0001F4DD Dry run"}
+
+
+def trade_taken_text(a):
+    """Compact 'Trade taken' message. Returns (title, body) for notify()."""
+    arrow = "\u25B2" if a["name"] == "UP" else "\u25BC"
+    c = a.get("p_win", 0.5)
+    lvl, sq = ("High", "\U0001F7E9") if c >= 0.75 else ("Medium", "\U0001F7E8") if c >= 0.60 else ("Low", "\U0001F7E5")
+    cnt = a["count"]
+    return (f"\U0001F7E2 Trade taken \u00B7 {MODE_LABEL.get(a.get('mode'), a.get('mode', ''))}",
+            f"{LABEL} {arrow} {a['name']} \u00B7 {STRATEGY}\n"
+            f"{cnt:g} shares @ {a['cost'] * 100:.0f}\u00A2 \u00B7 ${cnt * a['cost']:,.2f}\n"
+            f"\U0001F537 Standard \u00B7 \U0001F3AF {lvl} {sq}")
+
+
+def trade_result_text(t, win, pnl_per_contract):
+    """Compact Won/Lost message. Returns (title, body) for notify()."""
+    arrow = "\u25B2" if t["name"] == "UP" else "\u25BC"
+    cnt = t["count"]
+    total = pnl_per_contract * cnt
+    sign = "+" if total >= 0 else "-"
+    return (f"{'\U0001F389 Won' if win else chr(0x274C) + ' Lost'} \u00B7 {MODE_LABEL.get(t.get('mode'), t.get('mode', ''))}",
+            f"{LABEL} {arrow} {t['name']} \u00B7 {STRATEGY}\n"
+            f"{cnt:g} shares @ {t['cost'] * 100:.0f}\u00A2 \u2192 {'$1' if win else '$0'}\n"
+            f"{sign}${abs(total):,.2f}\n"
+            f"{'\U0001F3C1 Rode to $1' if win else '\U0001F6D1 Settled at $0'}")
+
+
 def mark(ok):
     return "\u2705" if ok else "\u274C"
 
@@ -669,6 +699,7 @@ class Ledger:
             rec["trade"], rec["pnl"] = trade, round(pnl, 4)
             with self.lock:
                 self.pnl.append(pnl)
+            notify(*trade_result_text(trade, win, pnl))
         lines = []
         if call:
             chit = (call["side"] == "UP") == (y == 1.0)
@@ -1480,10 +1511,11 @@ class Bot:
         if not self.send or not live_ok:
             mode_tag = "PAPER" if self.send else "DRY RUN"
             self._say("gate" + tk, f"{mode_tag}: {desc}" + ("" if live_ok else f" | gate closed: {why}"), every=60)
-            self.ledger.add_trade(tk, a)
+            ta = dict(a, mode=mode_tag)
+            self.ledger.add_trade(tk, ta)
             self.traded.add(tk)
             self.save()
-            notify(f"Kalshi {mode_tag} signal", desc)
+            notify(*trade_taken_text(ta))
             return
         res = self.api.place(tk, a["side"], a["price"], a["count"])
         try:
@@ -1493,14 +1525,15 @@ class Bot:
         print(f"[{stamp()}] ORDER {desc} -> filled {res.get('fill_count')} of {a['count']}")
         log_line(CALIB_LOG, {"t": datetime.now(timezone.utc).isoformat(), "market": tk, "order": a, "response": res})
         if filled > 0:
-            self.ledger.add_trade(tk, a)
+            fa = dict(a, mode="LIVE" if self.gated else "DEMO", count=round(filled, 2))
+            self.ledger.add_trade(tk, fa)
             self.traded.add(tk)
             self.trades_today += 1
             try:
                 self.refresh_balance()
             except Exception:
                 pass
-            notify("Kalshi order", f"{desc}\nFilled {res.get('fill_count')} of {a['count']}. Gate: {why or 'open'}")
+            notify(*trade_taken_text(fa))
         else:
             tries += 1
             self.attempts[tk] = (tries, time.time() + RETRY_SECS)
